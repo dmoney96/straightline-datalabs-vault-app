@@ -13,7 +13,7 @@ def build_schema():
     return Schema(
         doc_id=ID(stored=True, unique=True),
         source_file=ID(stored=True),
-        content=TEXT(stored=True, analyzer=StemmingAnalyzer())
+        content=TEXT(stored=True, analyzer=StemmingAnalyzer()),
     )
 
 
