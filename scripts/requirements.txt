@@ -2,3 +2,6 @@ requests
 beautifulsoup4
 pdfminer.six
 pillow
+fastapi
+uvicorn[standard]
+python-multipart
