@@ -1,160 +1,180 @@
 from __future__ import annotations
 
 import argparse
-import sys
 from pathlib import Path
 
 from whoosh.index import open_dir
 from whoosh.qparser import QueryParser
 from whoosh import scoring
 
-# Make sure project root is on sys.path
-ROOT = Path(__file__).resolve().parent
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
+from vault_core.paths import INPUT_DIR, OCR_DIR, OUTPUT_DIR
+from vault_core.logging_config import get_logger
+from vault_core.ocr import pdf_to_text
+from vault_core.ingest.fetch import fetch_pdf
+from scripts import index_docs as index_mod
 
-from vault_core.paths import INPUT_DIR, OCR_DIR, OUTPUT_DIR  # noqa: E402
-from vault_core.logging_config import get_logger            # noqa: E402
-from vault_core.ingest import fetch_pdf                     # noqa: E402
-from vault_core.ocr import pdf_to_text                      # noqa: E402
 
 logger = get_logger("cli")
 INDEX_DIR = OUTPUT_DIR / "index"
 
 
-# -------- subcommand handlers --------
+# ------------ Commands ------------
 
-def cmd_fetch(args: argparse.Namespace) -> None:
+def cmd_ingest_url(args: argparse.Namespace) -> None:
     """
-    Fetch a PDF by URL into input/.
+    Fetch a PDF from a URL, OCR it, and reindex the corpus.
     """
     url = args.url
-    logger.info("CLI fetch: %s", url)
-    out_path = fetch_pdf(url)
-    print(f"Downloaded → {out_path}")
+    logger.info("Ingesting from URL: %s", url)
+
+    # Let fetch_pdf decide filename + location and return the path
+    pdf_path = fetch_pdf(url)
+    pdf_path = Path(pdf_path)
+
+    logger.info("Fetched → %s", pdf_path)
+
+    # OCR → ocr/<name>.txt
+    txt_path = OCR_DIR / (pdf_path.stem + ".txt")
+    logger.info("Running OCR → %s", txt_path)
+    pdf_to_text(pdf_path, txt_path)
+
+    # Rebuild index
+    logger.info("Rebuilding index after ingest")
+    index_mod.create_index()
+
+    print(f"✅ Ingest complete for {url}")
+    print(f"   PDF:  {pdf_path}")
+    print(f"   Text: {txt_path}")
+    print(f"   Index: {INDEX_DIR}")
 
 
-def cmd_ocr(args: argparse.Namespace) -> None:
+def cmd_ocr_file(args: argparse.Namespace) -> None:
     """
-    Run OCR on a single PDF in input/ and write text to ocr/.
+    OCR a local PDF in input/ into ocr/ and reindex.
     """
-    pdf_arg = args.pdf
-    pdf_path = Path(pdf_arg)
+    name_or_path = args.path
+    pdf_path = Path(name_or_path)
+
     if not pdf_path.is_absolute():
-        pdf_path = INPUT_DIR / pdf_arg
+        pdf_path = INPUT_DIR / name_or_path
 
     if not pdf_path.exists():
-        raise SystemExit(f"PDF not found: {pdf_path}")
+        raise FileNotFoundError(f"{pdf_path} does not exist")
 
-    out_txt = OCR_DIR / (pdf_path.stem + ".txt")
-    out_txt.parent.mkdir(parents=True, exist_ok=True)
+    txt_path = OCR_DIR / (pdf_path.stem + ".txt")
+    logger.info("OCR local PDF %s → %s", pdf_path, txt_path)
+    pdf_to_text(pdf_path, txt_path)
 
-    logger.info("CLI ocr: %s -> %s", pdf_path, out_txt)
-    pdf_to_text(pdf_path, out_txt)
-    print(f"OCR complete → {out_txt}")
+    logger.info("Rebuilding index after OCR")
+    index_mod.create_index()
+
+    print(f"✅ OCR complete for {pdf_path}")
+    print(f"   Text: {txt_path}")
+    print(f"   Index: {INDEX_DIR}")
 
 
-def cmd_index(args: argparse.Namespace) -> None:
+def cmd_reindex(args: argparse.Namespace) -> None:
     """
-    Rebuild the Whoosh index from all .txt files in ocr/.
+    Rebuild the Whoosh index from all files in ocr/.
     """
-    logger.info("CLI index: rebuilding index at %s", INDEX_DIR)
-    # Reuse the script function instead of duplicating code.
-    from scripts.index_docs import create_index  # type: ignore
-
-    create_index()
-    print(f"Index stored in {INDEX_DIR}")
+    logger.info("Manual reindex requested")
+    index_mod.create_index()
+    print(f"✅ Index rebuilt at {INDEX_DIR}")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
     """
-    Search the index and print ranked results with snippets.
+    Search the local index from the CLI.
     """
-    query_text = " ".join(args.terms)
-    logger.info("CLI search: %r", query_text)
+    query_text = " ".join(args.terms).strip()
+    if not query_text:
+        print("Please provide search terms.")
+        return
 
     if not INDEX_DIR.exists():
-        raise SystemExit(f"Index directory does not exist: {INDEX_DIR}")
+        raise SystemExit(f"Index directory {INDEX_DIR} does not exist. Run `reindex` or `ingest-url` first.")
 
-    from textwrap import fill
+    logger.info("CLI search: %r", query_text)
 
-    try:
-        ix = open_dir(INDEX_DIR)
-    except Exception as e:  # noqa: BLE001
-        logger.exception("Failed to open index: %s", e)
-        raise SystemExit("Failed to open index; did you run 'index' first?") from e
+    ix = open_dir(INDEX_DIR)
+    parser = QueryParser("content", schema=ix.schema)
 
     with ix.searcher(weighting=scoring.BM25F()) as searcher:
-        qp = QueryParser("content", schema=ix.schema)
-        query = qp.parse(query_text)
-        results = searcher.search(query, limit=args.limit)
+        q = parser.parse(query_text)
+        results = searcher.search(q, limit=args.limit)
+
+        print(f"🔎 Query: {query_text!r}")
+        print(f"   Hits: {len(results)}\n")
 
         if not results:
-            print(f"No results for query: {query_text!r}")
             return
 
-        print(f"🔎 Search: {query_text!r}\n")
         for hit in results:
-            doc_id = hit["doc_id"]
-            src = hit["source_file"]
-            score = float(hit.score)
-            snippet = (
-                hit.highlights("content", top=2)
-                or hit.get("content", "")[:200]
-            )
+            doc_id = hit.get("doc_id", "<unknown>")
+            source = hit.get("source_file", "<unknown>")
 
-            print(f"📄 {doc_id}  (score={score:.2f})")
-            print(f"    Source: {src}")
+            print(f"📄 {doc_id}  (score={hit.score:.2f})")
+            print(f"    Source: {source}")
             print("-" * 80)
-            print(fill(snippet, width=78))
+            snippet = hit.highlights("content", top=2) or hit.get("content", "")[:240]
+            print(snippet)
             print()
 
 
-# -------- argparse wiring --------
+# ------------ Argparser wiring ------------
 
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
-        prog="vault",
-        description="StraightLine DataLabs Vault CLI",
+    p = argparse.ArgumentParser(
+        prog="vault_cli",
+        description="StraightLine DataLabs Vault – ingest + search CLI",
     )
-    sub = parser.add_subparsers(dest="command", required=True)
 
-    # fetch
-    p_fetch = sub.add_parser("fetch", help="Fetch a PDF URL into input/")
-    p_fetch.add_argument("url", help="HTTP(S) URL of the PDF")
-    p_fetch.set_defaults(func=cmd_fetch)
+    sub = p.add_subparsers(dest="command", required=True)
 
-    # ocr
-    p_ocr = sub.add_parser("ocr", help="Run OCR on a PDF in input/")
-    p_ocr.add_argument("pdf", help="PDF filename or path (relative to input/ by default)")
-    p_ocr.set_defaults(func=cmd_ocr)
+    # ingest-url
+    p_ing_url = sub.add_parser(
+        "ingest-url",
+        help="Fetch a PDF from a URL, OCR it, and reindex",
+    )
+    p_ing_url.add_argument("url", help="Public PDF URL")
+    p_ing_url.set_defaults(func=cmd_ingest_url)
 
-    # index
-    p_index = sub.add_parser("index", help="Rebuild search index from ocr/*.txt")
-    p_index.set_defaults(func=cmd_index)
+    # ocr-file
+    p_ocr = sub.add_parser(
+        "ocr-file",
+        help="OCR a local PDF in input/ and reindex",
+    )
+    p_ocr.add_argument("path", help="PDF name or path (relative to input/ if not absolute)")
+    p_ocr.set_defaults(func=cmd_ocr_file)
+
+    # reindex
+    p_idx = sub.add_parser(
+        "reindex",
+        help="Rebuild the index from existing OCR text files",
+    )
+    p_idx.set_defaults(func=cmd_reindex)
 
     # search
-    p_search = sub.add_parser("search", help="Search the index")
+    p_search = sub.add_parser(
+        "search",
+        help="Search the local index from the CLI",
+    )
     p_search.add_argument("terms", nargs="+", help="Search terms")
     p_search.add_argument(
         "--limit",
         type=int,
         default=10,
-        help="Max number of results (default: 10)",
+        help="Max results to show (default: 10)",
     )
     p_search.set_defaults(func=cmd_search)
 
-    return parser
+    return p
 
 
 def main(argv: list[str] | None = None) -> None:
     parser = build_parser()
     args = parser.parse_args(argv)
-    try:
-        args.func(args)
-    except KeyboardInterrupt:
-        print("\nInterrupted.", file=sys.stderr)
-        raise SystemExit(130)
+    args.func(args)
 
 
 if __name__ == "__main__":
