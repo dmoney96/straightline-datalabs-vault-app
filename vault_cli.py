@@ -50,9 +50,9 @@ def cmd_ingest_url(args: argparse.Namespace) -> None:
     index_mod.create_index()
 
     print(f"✅ Ingest complete for {url}")
-    print(f"   PDF:     {pdf_path}")
-    print(f"   Text:    {txt_path}")
-    print(f"   Index:   {INDEX_DIR}")
+    print(f"   PDF:   {pdf_path}")
+    print(f"   Text:  {txt_path}")
+    print(f"   Index: {INDEX_DIR}")
 
 
 def cmd_ocr_file(args: argparse.Namespace) -> None:
@@ -72,7 +72,6 @@ def cmd_ocr_file(args: argparse.Namespace) -> None:
     logger.info("OCR local PDF %s → %s", pdf_path, txt_path)
     pdf_to_text(pdf_path, txt_path)
 
-    # Manifest entry
     rec = make_record(
         doc_id=pdf_path.stem,
         source_file=pdf_path,
@@ -81,28 +80,21 @@ def cmd_ocr_file(args: argparse.Namespace) -> None:
     )
     append_record(rec)
 
-    # Rebuild index
     logger.info("Rebuilding index after OCR")
     index_mod.create_index()
 
     print(f"✅ OCR complete for {pdf_path}")
-    print(f"   Text:    {txt_path}")
-    print(f"   Index:   {INDEX_DIR}")
+    print(f"   Text:  {txt_path}")
+    print(f"   Index: {INDEX_DIR}")
 
 
 def cmd_reindex(args: argparse.Namespace) -> None:
-    """
-    Rebuild the Whoosh index from all files in ocr/.
-    """
     logger.info("Manual reindex requested")
     index_mod.create_index()
     print(f"✅ Index rebuilt at {INDEX_DIR}")
 
 
 def cmd_search(args: argparse.Namespace) -> None:
-    """
-    Search the local index from the CLI.
-    """
     query_text = " ".join(args.terms).strip()
     if not query_text:
         print("Please provide search terms.")
@@ -140,9 +132,6 @@ def cmd_search(args: argparse.Namespace) -> None:
 
 
 def cmd_list_docs(args: argparse.Namespace) -> None:
-    """
-    List all documents known to the manifest.
-    """
     recs = list(iter_records())
     if not recs:
         print("No documents in manifest yet.")
@@ -160,22 +149,16 @@ def cmd_list_docs(args: argparse.Namespace) -> None:
 
 
 def cmd_show_doc(args: argparse.Namespace) -> None:
-    """
-    Show full manifest record for a single doc_id.
-    """
     target = args.doc_id
     for rec in iter_records():
         if rec.get("doc_id") == target:
             print(f"Manifest record for {target!r}:")
-            # pretty-print
             import json
             print(json.dumps(rec, indent=2, ensure_ascii=False))
             return
 
     print(f"No manifest record found for doc_id={target!r}")
 
-
-# ------------ Argparser wiring ------------
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
