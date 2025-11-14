@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import argparse
+import subprocess
+import sys
 from pathlib import Path
 
 from whoosh.index import open_dir
@@ -12,11 +14,16 @@ from vault_core.logging_config import get_logger
 from vault_core.ocr import pdf_to_text
 from vault_core.ingest.fetch import fetch_pdf
 from vault_core.manifest import make_record, append_record, iter_records
-from scripts import index_docs as index_mod
 
 
 logger = get_logger("cli")
 INDEX_DIR = OUTPUT_DIR / "index"
+
+
+def _run_reindex() -> None:
+    """Call the existing scripts/index_docs.py via subprocess."""
+    logger.info("Rebuilding index via scripts/index_docs.py")
+    subprocess.run([sys.executable, "scripts/index_docs.py"], check=True)
 
 
 # ------------ Commands ------------
@@ -31,12 +38,10 @@ def cmd_ingest_url(args: argparse.Namespace) -> None:
     pdf_path = Path(fetch_pdf(url))
     logger.info("Fetched → %s", pdf_path)
 
-    # OCR → ocr/<stem>.txt
     txt_path = OCR_DIR / (pdf_path.stem + ".txt")
     logger.info("Running OCR → %s", txt_path)
     pdf_to_text(pdf_path, txt_path)
 
-    # Manifest entry
     rec = make_record(
         doc_id=pdf_path.stem,
         source_file=pdf_path,
@@ -44,10 +49,9 @@ def cmd_ingest_url(args: argparse.Namespace) -> None:
         source_url=url,
     )
     append_record(rec)
+    logger.info("Manifest updated for doc_id=%s", pdf_path.stem)
 
-    # Rebuild index
-    logger.info("Rebuilding index after ingest")
-    index_mod.create_index()
+    _run_reindex()
 
     print(f"✅ Ingest complete for {url}")
     print(f"   PDF:   {pdf_path}")
@@ -79,9 +83,9 @@ def cmd_ocr_file(args: argparse.Namespace) -> None:
         source_url=None,
     )
     append_record(rec)
+    logger.info("Manifest updated for doc_id=%s", pdf_path.stem)
 
-    logger.info("Rebuilding index after OCR")
-    index_mod.create_index()
+    _run_reindex()
 
     print(f"✅ OCR complete for {pdf_path}")
     print(f"   Text:  {txt_path}")
@@ -89,8 +93,8 @@ def cmd_ocr_file(args: argparse.Namespace) -> None:
 
 
 def cmd_reindex(args: argparse.Namespace) -> None:
-    logger.info("Manual reindex requested")
-    index_mod.create_index()
+    logger.info("Manual reindex requested via CLI")
+    _run_reindex()
     print(f"✅ Index rebuilt at {INDEX_DIR}")
 
 
@@ -101,8 +105,10 @@ def cmd_search(args: argparse.Namespace) -> None:
         return
 
     if not INDEX_DIR.exists():
-        raise SystemExit(f"Index directory {INDEX_DIR} does not exist. "
-                         "Run `reindex` or `ingest-url` first.")
+        raise SystemExit(
+            f"Index directory {INDEX_DIR} does not exist. "
+            "Run `ingest-url`, `ocr-file`, or `reindex` first."
+        )
 
     logger.info("CLI search: %r", query_text)
 

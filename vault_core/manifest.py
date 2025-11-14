@@ -24,7 +24,7 @@ def make_record(
 ) -> Dict[str, Any]:
     """
     Build a normalized manifest record.
-    ingest_type: "url" or "local" (for now).
+    ingest_type: e.g. "url" or "local".
     """
     return {
         "doc_id": doc_id,
@@ -50,6 +50,7 @@ def iter_records() -> Iterable[Dict[str, Any]]:
     Iterate over all manifest records. Safe if file doesn't exist.
     """
     if not MANIFEST_PATH.exists():
+        # Empty generator
         return []
 
     def _gen():
