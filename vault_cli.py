@@ -11,6 +11,7 @@ from vault_core.paths import INPUT_DIR, OCR_DIR, OUTPUT_DIR
 from vault_core.logging_config import get_logger
 from vault_core.ocr import pdf_to_text
 from vault_core.ingest.fetch import fetch_pdf
+from vault_core.manifest import make_record, append_record, iter_records
 from scripts import index_docs as index_mod
 
 
@@ -22,35 +23,41 @@ INDEX_DIR = OUTPUT_DIR / "index"
 
 def cmd_ingest_url(args: argparse.Namespace) -> None:
     """
-    Fetch a PDF from a URL, OCR it, and reindex the corpus.
+    Fetch a PDF from a URL, OCR it, log manifest, and reindex the corpus.
     """
     url = args.url
     logger.info("Ingesting from URL: %s", url)
 
-    # Let fetch_pdf decide filename + location and return the path
-    pdf_path = fetch_pdf(url)
-    pdf_path = Path(pdf_path)
-
+    pdf_path = Path(fetch_pdf(url))
     logger.info("Fetched → %s", pdf_path)
 
-    # OCR → ocr/<name>.txt
+    # OCR → ocr/<stem>.txt
     txt_path = OCR_DIR / (pdf_path.stem + ".txt")
     logger.info("Running OCR → %s", txt_path)
     pdf_to_text(pdf_path, txt_path)
+
+    # Manifest entry
+    rec = make_record(
+        doc_id=pdf_path.stem,
+        source_file=pdf_path,
+        ingest_type="url",
+        source_url=url,
+    )
+    append_record(rec)
 
     # Rebuild index
     logger.info("Rebuilding index after ingest")
     index_mod.create_index()
 
     print(f"✅ Ingest complete for {url}")
-    print(f"   PDF:  {pdf_path}")
-    print(f"   Text: {txt_path}")
-    print(f"   Index: {INDEX_DIR}")
+    print(f"   PDF:     {pdf_path}")
+    print(f"   Text:    {txt_path}")
+    print(f"   Index:   {INDEX_DIR}")
 
 
 def cmd_ocr_file(args: argparse.Namespace) -> None:
     """
-    OCR a local PDF in input/ into ocr/ and reindex.
+    OCR a local PDF in input/ into ocr/, log manifest, and reindex.
     """
     name_or_path = args.path
     pdf_path = Path(name_or_path)
@@ -65,12 +72,22 @@ def cmd_ocr_file(args: argparse.Namespace) -> None:
     logger.info("OCR local PDF %s → %s", pdf_path, txt_path)
     pdf_to_text(pdf_path, txt_path)
 
+    # Manifest entry
+    rec = make_record(
+        doc_id=pdf_path.stem,
+        source_file=pdf_path,
+        ingest_type="local",
+        source_url=None,
+    )
+    append_record(rec)
+
+    # Rebuild index
     logger.info("Rebuilding index after OCR")
     index_mod.create_index()
 
     print(f"✅ OCR complete for {pdf_path}")
-    print(f"   Text: {txt_path}")
-    print(f"   Index: {INDEX_DIR}")
+    print(f"   Text:    {txt_path}")
+    print(f"   Index:   {INDEX_DIR}")
 
 
 def cmd_reindex(args: argparse.Namespace) -> None:
@@ -92,7 +109,8 @@ def cmd_search(args: argparse.Namespace) -> None:
         return
 
     if not INDEX_DIR.exists():
-        raise SystemExit(f"Index directory {INDEX_DIR} does not exist. Run `reindex` or `ingest-url` first.")
+        raise SystemExit(f"Index directory {INDEX_DIR} does not exist. "
+                         "Run `reindex` or `ingest-url` first.")
 
     logger.info("CLI search: %r", query_text)
 
@@ -121,6 +139,42 @@ def cmd_search(args: argparse.Namespace) -> None:
             print()
 
 
+def cmd_list_docs(args: argparse.Namespace) -> None:
+    """
+    List all documents known to the manifest.
+    """
+    recs = list(iter_records())
+    if not recs:
+        print("No documents in manifest yet.")
+        return
+
+    print(f"{len(recs)} document(s) in manifest:\n")
+    for rec in recs:
+        doc_id = rec.get("doc_id", "<unknown>")
+        ingest_type = rec.get("ingest_type", "?")
+        source_url = rec.get("source_url")
+        source_file = rec.get("source_file")
+
+        src_display = source_url or source_file
+        print(f"- {doc_id}  [{ingest_type}]  {src_display}")
+
+
+def cmd_show_doc(args: argparse.Namespace) -> None:
+    """
+    Show full manifest record for a single doc_id.
+    """
+    target = args.doc_id
+    for rec in iter_records():
+        if rec.get("doc_id") == target:
+            print(f"Manifest record for {target!r}:")
+            # pretty-print
+            import json
+            print(json.dumps(rec, indent=2, ensure_ascii=False))
+            return
+
+    print(f"No manifest record found for doc_id={target!r}")
+
+
 # ------------ Argparser wiring ------------
 
 def build_parser() -> argparse.ArgumentParser:
@@ -134,7 +188,7 @@ def build_parser() -> argparse.ArgumentParser:
     # ingest-url
     p_ing_url = sub.add_parser(
         "ingest-url",
-        help="Fetch a PDF from a URL, OCR it, and reindex",
+        help="Fetch a PDF from a URL, OCR it, log manifest, and reindex",
     )
     p_ing_url.add_argument("url", help="Public PDF URL")
     p_ing_url.set_defaults(func=cmd_ingest_url)
@@ -167,6 +221,21 @@ def build_parser() -> argparse.ArgumentParser:
         help="Max results to show (default: 10)",
     )
     p_search.set_defaults(func=cmd_search)
+
+    # list-docs
+    p_list = sub.add_parser(
+        "list-docs",
+        help="List documents known to the manifest",
+    )
+    p_list.set_defaults(func=cmd_list_docs)
+
+    # show-doc
+    p_show = sub.add_parser(
+        "show-doc",
+        help="Show manifest metadata for a single document",
+    )
+    p_show.add_argument("doc_id", help="Document ID (usually the PDF stem)")
+    p_show.set_defaults(func=cmd_show_doc)
 
     return p
 
