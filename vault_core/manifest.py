@@ -3,74 +3,51 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, Iterable
 
-from .paths import DATA_DIR
+from vault_core.paths import DATA_DIR
 
-
+# Single JSONL manifest file:
+# each line = one JSON object describing a source (pdf/txt/provenance/etc.)
 MANIFEST_PATH = DATA_DIR / "manifest.jsonl"
 
 
-def _now_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def make_record(
-    doc_id: str,
-    source_file: Path | str,
-    ingest_type: str,
-    source_url: str | None = None,
-    *,
-    tenant_id: str = "default",
-    tags: Optional[List[str]] = None,
-    collection: str | None = None,
-    extra: Dict[str, Any] | None = None,
-) -> Dict[str, Any]:
+def append_manifest_entry(record: Dict[str, Any]) -> None:
     """
-    Build a normalized manifest record.
+    Append a single record to the manifest JSONL file.
 
-    ingest_type: "url", "local", etc.
-    tenant_id:   logical owner / namespace (single-tenant for now, but future-proof).
-    tags:        lightweight labels (["irs", "lawsuit", ...]).
-    collection:  a named grouping (e.g. "tax-guides-2025").
+    The ingest pipeline passes in something like:
+        {
+            "pdf": "...",
+            "txt": "...",
+            "provenance": "...",
+            "source_url": "https://..." or None,
+        }
+
+    We add a UTC timestamp and write it as one line of JSON.
     """
-    base_extra: Dict[str, Any] = {}
-    if extra:
-        base_extra.update(extra)
+    entry: Dict[str, Any] = dict(record)
+    entry["timestamp"] = datetime.now(timezone.utc).isoformat()
 
-    if tags is not None:
-        base_extra.setdefault("tags", list(tags))
-    if collection is not None:
-        base_extra.setdefault("collection", collection)
-
-    return {
-        "doc_id": doc_id,
-        "tenant_id": tenant_id,
-        "source_file": str(source_file),
-        "ingest_type": ingest_type,
-        "source_url": source_url,
-        "created_at": _now_iso(),
-        "extra": base_extra,
-    }
-
-
-def append_record(record: Dict[str, Any]) -> None:
-    """
-    Append a single record as JSONL.
-    """
-    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    MANIFEST_PATH.parent.mkdir(parents=True, exist_ok=True)
     with MANIFEST_PATH.open("a", encoding="utf-8") as f:
-        f.write(json.dumps(record, ensure_ascii=False) + "\n")
+        json.dump(entry, f, ensure_ascii=False)
+        f.write("\n")
 
 
-def iter_records() -> Iterable[Dict[str, Any]]:
+def iter_manifest() -> Iterable[Dict[str, Any]]:
     """
-    Iterate over all manifest records. Safe if file doesn't exist.
+    Iterate over all manifest entries as dicts.
+
+    This will be handy later for building:
+      - a UI that browses ingested documents
+      - audits of who ingested what and when
     """
     if not MANIFEST_PATH.exists():
+        # Return an empty iterable
         return []
 
-    def _gen():
+    def _gen() -> Iterable[Dict[str, Any]]:
         with MANIFEST_PATH.open("r", encoding="utf-8") as f:
             for line in f:
                 line = line.strip()
@@ -79,7 +56,14 @@ def iter_records() -> Iterable[Dict[str, Any]]:
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError:
-                    # Skip malformed lines rather than blowing up.
+                    # Skip malformed lines instead of exploding
                     continue
 
     return _gen()
+
+
+__all__ = [
+    "MANIFEST_PATH",
+    "append_manifest_entry",
+    "iter_manifest",
+]
