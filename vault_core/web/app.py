@@ -270,3 +270,58 @@ def get_doc(doc_id: str):
         created_at=rec.get("created_at"),
         text_preview=text_preview,
     )
+
+@app.get("/")
+def root():
+    """
+    Simple root so hitting the base URL doesn't 404.
+    """
+    return {
+        "status": "ok",
+        "service": "StraightLine Data Vault API",
+        "version": "0.1.0",
+        "endpoints": [
+            "/search",
+            "/docs",
+            "/doc/{doc_id}",
+            "/health",
+            "/docs (Swagger UI)",
+            "/openapi.json",
+        ],
+    }
+
+
+@app.get("/health")
+def health():
+    """
+    Minimal health check.
+
+    Later we can expand this to verify:
+      - disk space
+      - index freshness
+      - background workers, etc.
+    """
+    problems = []
+
+    # Check index directory
+    if not INDEX_DIR.exists():
+        problems.append(f"Index directory {INDEX_DIR} does not exist")
+    else:
+        try:
+            _ = open_dir(str(INDEX_DIR))
+        except EmptyIndexError:
+            problems.append(f"Index in {INDEX_DIR} is empty or invalid")
+        except Exception as e:
+            problems.append(f"Error opening index: {e!r}")
+
+    status = "ok" if not problems else "degraded"
+    if problems:
+        logger.error("Health check issues: %s", problems)
+    else:
+        logger.info("Health check OK")
+
+    return {
+        "status": status,
+        "problems": problems,
+        "index_dir": str(INDEX_DIR),
+    }
