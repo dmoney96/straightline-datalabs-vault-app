@@ -1,15 +1,18 @@
+# scripts/index_docs.py
+
+from pathlib import Path
 from whoosh.fields import Schema, TEXT, ID
 from whoosh import index
 from whoosh.analysis import StemmingAnalyzer
-
 import shutil
+
 from paths import OCR_DIR, OUTPUT_DIR
 
 INDEX_DIR = OUTPUT_DIR / "index"
 
 
 def build_schema():
-    # Store content so we can show snippets/highlights
+    # Store doc_id + source_file + content so we can show snippets later
     return Schema(
         doc_id=ID(stored=True, unique=True),
         source_file=ID(stored=True),
