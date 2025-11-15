@@ -1,0 +1,10 @@
+{
+  "id": "a2adf7533f7f492885bb3548a4d73ffa",
+  "source_path": "/home/dom/vault-app/input/p463.pdf",
+  "source_url": "https://www.irs.gov/pub/irs-pdf/p463.pdf",
+  "collected_at": "2025-11-15T19:57:35.431787+00:00",
+  "collected_by": "straightline-vault/manual-test",
+  "content_type": "pdf",
+  "notes": "Manual provenance test",
+  "extra": {}
+}

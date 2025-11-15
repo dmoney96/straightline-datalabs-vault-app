@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>StraightLine Vault Search</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <style>
+    :root {
+      color-scheme: dark;
+    }
+    body {
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      margin: 0;
+      padding: 1.5rem;
+      background: #020617;
+      color: #e5e7eb;
+    }
+    h1 {
+      margin-top: 0;
+      font-size: 1.8rem;
+    }
+    .sub {
+      color: #9ca3af;
+      font-size: 0.9rem;
+      margin-bottom: 1.5rem;
+    }
+    .search-box {
+      max-width: 800px;
+      margin-bottom: 1.5rem;
+      display: flex;
+      gap: 0.5rem;
+    }
+    .search-box input[type="text"] {
+      flex: 1;
+      padding: 0.6rem 0.8rem;
+      border-radius: 0.5rem;
+      border: 1px solid #1f2937;
+      background: #020617;
+      color: #e5e7eb;
+      outline: none;
+    }
+    .search-box input[type="text"]:focus {
+      border-color: #22c55e;
+      box-shadow: 0 0 0 1px #22c55e33;
+    }
+    .search-box button {
+      padding: 0.6rem 1rem;
+      border-radius: 0.5rem;
+      border: none;
+      background: #22c55e;
+      color: #022c22;
+      font-weight: 600;
+      cursor: pointer;
+      white-space: nowrap;
+    }
+    .search-box button:disabled {
+      opacity: 0.5;
+      cursor: default;
+    }
+    .status {
+      font-size: 0.9rem;
+      margin-bottom: 0.75rem;
+      color: #9ca3af;
+    }
+    .results {
+      max-width: 900px;
+      display: flex;
+      flex-direction: column;
+      gap: 0.75rem;
+    }
+    .card {
+      border-radius: 0.75rem;
+      border: 1px solid #1f2937;
+      padding: 0.9rem 1rem;
+      background: #020617;
+    }
+    .card-header {
+      display: flex;
+      justify-content: space-between;
+      gap: 0.75rem;
+      align-items: baseline;
+      margin-bottom: 0.35rem;
+    }
+    .doc-id {
+      font-weight: 600;
+      font-size: 0.95rem;
+    }
+    .meta-row {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.4rem;
+      margin-bottom: 0.4rem;
+    }
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      padding: 0.15rem 0.45rem;
+      border-radius: 999px;
+      font-size: 0.7rem;
+      text-transform: uppercase;
+      letter-spacing: 0.04em;
+      border: 1px solid #374151;
+    }
+    .badge-url {
+      border-color: #22c55e55;
+      color: #bbf7d0;
+    }
+    .badge-local {
+      border-color: #38bdf855;
+      color: #bae6fd;
+    }
+    .badge-tenant {
+      border-color: #a855f755;
+      color: #e9d5ff;
+    }
+    .badge-collection {
+      border-color: #f9731655;
+      color: #fed7aa;
+    }
+    .tags {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 0.25rem;
+      font-size: 0.7rem;
+      margin-bottom: 0.3rem;
+    }
+    .tag-pill {
+      padding: 0.15rem 0.45rem;
+      border-radius: 999px;
+      background: #111827;
+      color: #e5e7eb;
+      border: 1px solid #1f2937;
+    }
+    .snippet {
+      font-size: 0.85rem;
+      line-height: 1.35;
+    }
+    .snippet b.match {
+      color: #a5b4fc;
+    }
+    a.source-link {
+      color: #38bdf8;
+      text-decoration: none;
+    }
+    a.source-link:hover {
+      text-decoration: underline;
+    }
+  </style>
+</head>
+<body>
+  <h1>StraightLine Vault</h1>
+  <div class="sub">
+    People’s OSINT &amp; records vault · Search across your ingested PDFs with context.
+  </div>
+
+  <form class="search-box" id="search-form">
+    <input id="q" type="text" placeholder="Search your vault (e.g. mileage reimbursement, ethics policy, etc.)" />
+    <button type="submit">Search</button>
+  </form>
+
+  <div class="status" id="status">Enter a query to search.</div>
+  <div class="results" id="results"></div>
+
+  <script>
+    const form = document.getElementById("search-form");
+    const input = document.getElementById("q");
+    const statusEl = document.getElementById("status");
+    const resultsEl = document.getElementById("results");
+
+    function badgeForIngestType(t) {
+      if (!t) return null;
+      const span = document.createElement("span");
+      span.className = "badge " + (t === "url" ? "badge-url" : "badge-local");
+      span.textContent = t === "url" ? "URL" : "LOCAL";
+      return span;
+    }
+
+    function badge(className, text) {
+      const span = document.createElement("span");
+      span.className = "badge " + className;
+      span.textContent = text;
+      return span;
+    }
+
+    function renderResults(payload) {
+      resultsEl.innerHTML = "";
+
+      if (!payload || !payload.results || payload.results.length === 0) {
+        statusEl.textContent = `No results for ${JSON.stringify(payload?.query || "")}.`;
+        return;
+      }
+
+      statusEl.textContent = `Found ${payload.total} result(s) for ${JSON.stringify(payload.query)}.`;
+
+      for (const r of payload.results) {
+        const card = document.createElement("div");
+        card.className = "card";
+
+        const header = document.createElement("div");
+        header.className = "card-header";
+
+        const title = document.createElement("div");
+        title.className = "doc-id";
+        title.textContent = r.doc_id || "<unknown>";
+
+        const score = document.createElement("div");
+        score.style.fontSize = "0.75rem";
+        score.style.color = "#9ca3af";
+        score.textContent = `score ${r.score?.toFixed(2)}`;
+
+        header.appendChild(title);
+        header.appendChild(score);
+        card.appendChild(header);
+
+        // Meta row: ingest type, tenant, collection
+        const meta = document.createElement("div");
+        meta.className = "meta-row";
+
+        const ingestBadge = badgeForIngestType(r.ingest_type);
+        if (ingestBadge) meta.appendChild(ingestBadge);
+
+        if (r.tenant_id) {
+          meta.appendChild(badge("badge-tenant", `tenant: ${r.tenant_id}`));
+        }
+        if (r.collection) {
+          meta.appendChild(badge("badge-collection", r.collection));
+        }
+
+        // Source link/file
+        if (r.source_url) {
+          const link = document.createElement("a");
+          link.href = r.source_url;
+          link.target = "_blank";
+          link.rel = "noopener noreferrer";
+          link.className = "source-link";
+          link.textContent = "source URL";
+          meta.appendChild(link);
+        } else if (r.source_file) {
+          const span = document.createElement("span");
+          span.textContent = r.source_file;
+          meta.appendChild(span);
+        }
+
+        if (meta.childNodes.length > 0) {
+          card.appendChild(meta);
+        }
+
+        // Tags
+        if (Array.isArray(r.tags) && r.tags.length > 0) {
+          const tagsRow = document.createElement("div");
+          tagsRow.className = "tags";
+          for (const t of r.tags) {
+            const tp = document.createElement("span");
+            tp.className = "tag-pill";
+            tp.textContent = t;
+            tagsRow.appendChild(tp);
+          }
+          card.appendChild(tagsRow);
+        }
+
+        // Snippet
+        const snippetDiv = document.createElement("div");
+        snippetDiv.className = "snippet";
+        snippetDiv.innerHTML = r.snippet || "";
+        card.appendChild(snippetDiv);
+
+        resultsEl.appendChild(card);
+      }
+    }
+
+    form.addEventListener("submit", async (ev) => {
+      ev.preventDefault();
+      const q = input.value.trim();
+      if (!q) return;
+
+      statusEl.textContent = "Searching…";
+      resultsEl.innerHTML = "";
+      form.querySelector("button").disabled = true;
+
+      try {
+        const resp = await fetch(`/search?q=${encodeURIComponent(q)}`);
+        if (!resp.ok) {
+          statusEl.textContent = `Error: ${resp.status}`;
+          return;
+        }
+        const data = await resp.json();
+        renderResults(data);
+      } catch (err) {
+        console.error(err);
+        statusEl.textContent = "Error while searching. Check logs.";
+      } finally {
+        form.querySelector("button").disabled = false;
+      }
+    });
+  </script>
+</body>
+</html>

@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.responses import HTMLResponse
 from pydantic import BaseModel
 
 from whoosh.index import open_dir, EmptyIndexError
@@ -16,19 +17,16 @@ ROOT = Path(__file__).resolve().parents[2]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vault_core.paths import OUTPUT_DIR  # noqa: E402
+from vault_core.paths import OUTPUT_DIR, OCR_DIR  # noqa: E402
 from vault_core.logging_config import get_logger  # noqa: E402
 from vault_core.manifest import iter_records  # noqa: E402
 
 
 app = FastAPI(
     title="StraightLine Data Vault API",
-    version="0.1.0",
-    description="Search + document metadata API for StraightLine Vault",
 )
 
 logger = get_logger("api")
-
 INDEX_DIR = OUTPUT_DIR / "index"
 
 
@@ -40,8 +38,8 @@ class SearchHit(BaseModel):
     source_file: str
     score: float
     snippet: str
-    tenant_id: str = "default"
-    ingest_type: str = "unknown"
+    tenant_id: str
+    ingest_type: str
 
 
 class SearchResponse(BaseModel):
@@ -73,25 +71,15 @@ class DocDetail(DocSummary):
 # ---------- Helpers ----------
 
 
-def _open_index():
-    try:
-        return open_dir(str(INDEX_DIR))
-    except EmptyIndexError:
-        logger.error("Index directory %s does not contain a valid index", INDEX_DIR)
-        raise HTTPException(status_code=500, detail="Search index is empty or missing")
-
-
-def _manifest_index() -> Dict[str, Dict[str, Any]]:
-    """
-    Build a mapping doc_id -> manifest record for quick lookup.
-    """
-    records: Dict[str, Dict[str, Any]] = {}
+def _load_manifest_index() -> Dict[str, Dict[str, Any]]:
+    """Return manifest records keyed by doc_id."""
+    by_id: Dict[str, Dict[str, Any]] = {}
     for rec in iter_records():
         doc_id = rec.get("doc_id")
         if not doc_id:
             continue
-        records[doc_id] = rec
-    return records
+        by_id[doc_id] = rec
+    return by_id
 
 
 def _record_matches_filters(
@@ -100,86 +88,165 @@ def _record_matches_filters(
     tags: Optional[List[str]],
     collection: Optional[str],
 ) -> bool:
-    if tenant_id is not None:
-        if rec.get("tenant_id", "default") != tenant_id:
-            return False
+    if tenant_id and rec.get("tenant_id", "default") != tenant_id:
+        return False
 
     extra = rec.get("extra") or {}
 
-    if tags:
-        rec_tags = set(extra.get("tags") or [])
-        if not set(tags).issubset(rec_tags):
-            return False
+    if collection and extra.get("collection") != collection:
+        return False
 
-    if collection is not None:
-        if extra.get("collection") != collection:
+    if tags:
+        record_tags = set(extra.get("tags") or [])
+        if not set(tags).issubset(record_tags):
             return False
 
     return True
 
 
-# ---------- Endpoints ----------
+def _open_index():
+    if not INDEX_DIR.exists():
+        raise RuntimeError(f"Index directory {INDEX_DIR} does not exist")
+    return open_dir(str(INDEX_DIR))
+
+
+# ---------- HTML home ----------
+
+
+@app.get("/", response_class=HTMLResponse)
+def home() -> str:
+    return """
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <title>StraightLine Data Vault</title>
+  <style>
+    body { font-family: system-ui, -apple-system, BlinkMacSystemFont, sans-serif;
+           max-width: 900px; margin: 2rem auto; padding: 0 1rem; }
+    h1 { margin-bottom: 0.5rem; }
+    .search-box { margin: 1rem 0; display: flex; gap: 0.5rem; }
+    input[type="text"] { flex: 1; padding: 0.4rem 0.6rem; }
+    button { padding: 0.4rem 0.8rem; cursor: pointer; }
+    .result { border: 1px solid #ddd; border-radius: 6px; padding: 0.75rem;
+              margin-bottom: 0.75rem; }
+    .meta { font-size: 0.8rem; color: #666; }
+    pre { white-space: pre-wrap; font-size: 0.9rem; }
+    .badge { display: inline-block; padding: 0.1rem 0.4rem; margin-right: 0.25rem;
+             border-radius: 999px; background: #eee; font-size: 0.75rem; }
+  </style>
+</head>
+<body>
+  <h1>StraightLine Data Vault</h1>
+  <p>A tiny, sharp research index under construction. 🔍</p>
+
+  <div class="search-box">
+    <input id="q" type="text" placeholder="Search (e.g. 'travel expenses')" />
+    <button onclick="runSearch()">Search</button>
+  </div>
+
+  <div id="status"></div>
+  <div id="results"></div>
+
+<script>
+async function runSearch() {
+  const q = document.getElementById('q').value;
+  const status = document.getElementById('status');
+  const resultsDiv = document.getElementById('results');
+  status.textContent = 'Searching...';
+  resultsDiv.innerHTML = '';
+
+  try {
+    const resp = await fetch('/search?q=' + encodeURIComponent(q));
+    if (!resp.ok) {
+      status.textContent = 'Error: ' + resp.status;
+      return;
+    }
+    const data = await resp.json();
+    status.textContent = 'Found ' + data.total + ' result(s).';
+
+    for (const hit of data.results) {
+      const div = document.createElement('div');
+      div.className = 'result';
+      div.innerHTML = `
+        <div><strong>${hit.doc_id}</strong></div>
+        <div class="meta">
+          tenant=${hit.tenant_id} · type=${hit.ingest_type}<br/>
+          <small>${hit.source_file}</small>
+        </div>
+        <div>${hit.snippet}</div>
+      `;
+      resultsDiv.appendChild(div);
+    }
+  } catch (e) {
+    console.error(e);
+    status.textContent = 'Error: ' + e;
+  }
+}
+</script>
+</body>
+</html>
+    """
+
+
+# ---------- API endpoints ----------
 
 
 @app.get("/search", response_model=SearchResponse)
 def search(
-    q: str = Query(..., alias="q", description="Full-text search query"),
+    q: str = Query(..., min_length=1),
     limit: int = Query(20, ge=1, le=100),
-    tenant_id: Optional[str] = Query(
-        None, description="Optional tenant filter (future multi-tenant support)"
-    ),
-    tags: Optional[List[str]] = Query(
-        None,
-        description="Filter by tags (AND semantics: doc must have all specified tags)",
-    ),
-    collection: Optional[str] = Query(
-        None, description="Filter by logical collection/bucket name"
-    ),
-):
+    tenant_id: Optional[str] = Query(None),
+    tags: Optional[List[str]] = Query(None),
+    collection: Optional[str] = Query(None),
+) -> SearchResponse:
     logger.info(
         "Search q=%r limit=%d tenant_id=%r tags=%r collection=%r",
-        q,
-        limit,
-        tenant_id,
-        tags,
-        collection,
+        q, limit, tenant_id, tags, collection,
     )
 
-    ix = _open_index()
-    manifest_by_id = _manifest_index()
+    manifest_by_id = _load_manifest_index()
 
-    parser = QueryParser("content", schema=ix.schema)
-    query = parser.parse(q)
-
-    results: List[SearchHit] = []
+    try:
+        ix = _open_index()
+    except Exception as e:
+        logger.exception("Failed to open index: %r", e)
+        raise HTTPException(status_code=500, detail="Index not available")
 
     with ix.searcher(weighting=scoring.BM25F()) as searcher:
-        hits = searcher.search(query, limit=limit)
+        parser = QueryParser("content", schema=ix.schema)
+        query_obj = parser.parse(q)
+        hits = searcher.search(query_obj, limit=limit)
+
+        results: List[SearchHit] = []
 
         for hit in hits:
-            doc_id = hit["doc_id"]
-            rec = manifest_by_id.get(doc_id)
-
-            if rec and not _record_matches_filters(rec, tenant_id, tags, collection):
+            doc_id = hit.get("doc_id")
+            if not doc_id:
                 continue
 
-            snippet = hit.highlights("content", top=2) or hit.get("content", "")[:200]
-            source_file = hit.get("source_file", "")
+            rec = manifest_by_id.get(doc_id, {})
 
-            ingest_type = "unknown"
-            tenant = "default"
-            if rec:
-                ingest_type = rec.get("ingest_type", ingest_type)
-                tenant = rec.get("tenant_id", tenant)
+            # Apply manifest-level filters
+            if not _record_matches_filters(rec, tenant_id, tags, collection):
+                if tenant_id or tags or collection:
+                    # If the caller asked for filters and this record
+                    # doesn't match, skip it.
+                    continue
+
+            snippet = hit.highlights("content", top=2)
+            if not snippet:
+                content = hit.get("content", "")
+                snippet = content[:240]
 
             results.append(
                 SearchHit(
                     doc_id=doc_id,
-                    source_file=source_file,
+                    source_file=hit.get("source_file", rec.get("source_file", "")),
                     score=float(hit.score),
                     snippet=snippet,
-                    ingest_type=ingest_type,
-                    tenant_id=tenant,
+                    tenant_id=rec.get("tenant_id", "default"),
+                    ingest_type=rec.get("ingest_type", "unknown"),
                 )
             )
 
@@ -188,27 +255,12 @@ def search(
 
 @app.get("/docs", response_model=DocsResponse)
 def list_docs(
-    tenant_id: Optional[str] = Query(
-        None, description="Optional tenant filter for documents"
-    ),
-    tags: Optional[List[str]] = Query(
-        None, description="Filter docs by tags (AND semantics)"
-    ),
-    collection: Optional[str] = Query(
-        None, description="Filter docs by collection (e.g. 'tax-guides-2025')"
-    ),
-):
-    """
-    Return a summary list of all known documents from the manifest.
-    """
-    logger.info(
-        "List docs tenant_id=%r tags=%r collection=%r",
-        tenant_id,
-        tags,
-        collection,
-    )
+    tenant_id: Optional[str] = Query(None),
+    tags: Optional[List[str]] = Query(None),
+    collection: Optional[str] = Query(None),
+) -> DocsResponse:
+    manifest_by_id = _load_manifest_index()
 
-    manifest_by_id = _manifest_index()
     results: List[DocSummary] = []
 
     for doc_id, rec in manifest_by_id.items():
@@ -234,30 +286,23 @@ def list_docs(
 
 
 @app.get("/doc/{doc_id}", response_model=DocDetail)
-def get_doc(doc_id: str):
-    """
-    Return full manifest metadata + an optional text_preview if we can
-    find an OCR'd .txt.
-    """
-    manifest_by_id = _manifest_index()
+def get_doc(doc_id: str) -> DocDetail:
+    manifest_by_id = _load_manifest_index()
     rec = manifest_by_id.get(doc_id)
-
     if not rec:
         raise HTTPException(status_code=404, detail=f"Document {doc_id!r} not found")
 
     extra = rec.get("extra") or {}
 
+    # Try grabbing OCR text preview, if available
     text_preview: Optional[str] = None
     try:
-        # Try to guess an OCR file next to source_file, but fail softly.
-        if "source_file" in rec and rec["source_file"]:
-            src_path = Path(rec["source_file"])
-            txt_candidate = src_path.with_suffix(".txt")
-            if txt_candidate.exists():
-                text_preview = txt_candidate.read_text(errors="ignore")
+        txt_path = OCR_DIR / f"{doc_id}.txt"
+        if txt_path.exists():
+            text_preview = txt_path.read_text(errors="ignore")[:2000]
     except Exception:
-        # We don't want preview errors to break the API
-        logger.exception("Failed to load text_preview for doc_id=%s", doc_id)
+        # Best-effort; do not fail the endpoint on preview issues
+        pass
 
     return DocDetail(
         doc_id=doc_id,
@@ -271,44 +316,24 @@ def get_doc(doc_id: str):
         text_preview=text_preview,
     )
 
-@app.get("/")
-def root():
-    """
-    Simple root so hitting the base URL doesn't 404.
-    """
-    return {
-        "status": "ok",
-        "service": "StraightLine Data Vault API",
-        "version": "0.1.0",
-        "endpoints": [
-            "/search",
-            "/docs",
-            "/doc/{doc_id}",
-            "/health",
-            "/docs (Swagger UI)",
-            "/openapi.json",
-        ],
-    }
-
 
 @app.get("/health")
-def health():
-    """
-    Minimal health check.
+def health() -> Dict[str, Any]:
+    problems: List[str] = []
 
-    Later we can expand this to verify:
-      - disk space
-      - index freshness
-      - background workers, etc.
-    """
-    problems = []
+    # Check manifest has at least one record
+    manifest_records = list(iter_records())
+    if not manifest_records:
+        problems.append("Manifest is empty")
 
     # Check index directory
     if not INDEX_DIR.exists():
         problems.append(f"Index directory {INDEX_DIR} does not exist")
     else:
         try:
-            _ = open_dir(str(INDEX_DIR))
+            ix = open_dir(str(INDEX_DIR))
+            with ix.searcher() as s:
+                _ = s.doc_count()  # touch the index
         except EmptyIndexError:
             problems.append(f"Index in {INDEX_DIR} is empty or invalid")
         except Exception as e:

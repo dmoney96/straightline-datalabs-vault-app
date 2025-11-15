@@ -1,0 +1,6 @@
+{"doc_id": "demo-doc", "source_file": "input/demo.pdf", "ingest_type": "local", "source_url": null, "created_at": "2025-11-14T21:42:28.162780+00:00", "extra": {}}
+{"doc_id": "p463", "source_file": "/home/dom/vault-app/input/p463.pdf", "ingest_type": "url", "source_url": "https://www.irs.gov/pub/irs-pdf/p463.pdf", "created_at": "2025-11-14T21:47:41.970340+00:00", "extra": {}}
+{"doc_id": "demo-doc", "source_file": "input/demo.pdf", "ingest_type": "local", "source_url": null, "created_at": "2025-11-14T21:56:39.524227+00:00", "extra": {}}
+{"doc_id": "p463", "source_file": "/home/dom/vault-app/input/p463.pdf", "ingest_type": "url", "source_url": "https://www.irs.gov/pub/irs-pdf/p463.pdf", "created_at": "2025-11-14T22:00:40.572958+00:00", "extra": {}}
+{"doc_id": "demo-doc", "source_file": "input/demo.pdf", "ingest_type": "local", "source_url": null, "created_at": "2025-11-14T22:03:27.328307+00:00", "extra": {}}
+{"doc_id": "p463", "source_file": "/home/dom/vault-app/input/p463.pdf", "ingest_type": "url", "source_url": "https://www.irs.gov/pub/irs-pdf/p463.pdf", "created_at": "2025-11-14T22:07:25.571408+00:00", "extra": {}}

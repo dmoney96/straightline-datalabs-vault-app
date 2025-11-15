@@ -1,0 +1,19 @@
+[project]
+name = "straightline-vault"
+version = "0.1.0"
+description = "Distributed ingestion, OCR, indexing, and search engine for investigative work."
+authors = [
+    {name = "Dominique Miller", email = "dmoneydomo@proton.me"},
+]
+requires-python = ">=3.12"
+dependencies = [
+    "requests",
+    "pdf2image",
+    "pillow",
+    "pytesseract",
+    "whoosh",
+]
+
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"

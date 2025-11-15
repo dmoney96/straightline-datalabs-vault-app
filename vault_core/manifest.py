@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable
+from typing import Any, Dict, Iterable, List, Optional
 
 from .paths import DATA_DIR
 
@@ -20,19 +20,37 @@ def make_record(
     source_file: Path | str,
     ingest_type: str,
     source_url: str | None = None,
+    *,
+    tenant_id: str = "default",
+    tags: Optional[List[str]] = None,
+    collection: str | None = None,
     extra: Dict[str, Any] | None = None,
 ) -> Dict[str, Any]:
     """
     Build a normalized manifest record.
-    ingest_type: e.g. "url" or "local".
+
+    ingest_type: "url", "local", etc.
+    tenant_id:   logical owner / namespace (single-tenant for now, but future-proof).
+    tags:        lightweight labels (["irs", "lawsuit", ...]).
+    collection:  a named grouping (e.g. "tax-guides-2025").
     """
+    base_extra: Dict[str, Any] = {}
+    if extra:
+        base_extra.update(extra)
+
+    if tags is not None:
+        base_extra.setdefault("tags", list(tags))
+    if collection is not None:
+        base_extra.setdefault("collection", collection)
+
     return {
         "doc_id": doc_id,
+        "tenant_id": tenant_id,
         "source_file": str(source_file),
         "ingest_type": ingest_type,
         "source_url": source_url,
         "created_at": _now_iso(),
-        "extra": extra or {},
+        "extra": base_extra,
     }
 
 
@@ -50,7 +68,6 @@ def iter_records() -> Iterable[Dict[str, Any]]:
     Iterate over all manifest records. Safe if file doesn't exist.
     """
     if not MANIFEST_PATH.exists():
-        # Empty generator
         return []
 
     def _gen():
@@ -62,7 +79,7 @@ def iter_records() -> Iterable[Dict[str, Any]]:
                 try:
                     yield json.loads(line)
                 except json.JSONDecodeError:
-                    # Skip bad lines rather than blowing up
+                    # Skip malformed lines rather than blowing up.
                     continue
 
     return _gen()

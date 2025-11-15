@@ -12,6 +12,9 @@ OUTPUT_DIR = ROOT / "output"
 LOG_DIR = ROOT / "logs"
 DATA_DIR = ROOT / "data"
 
+# Search index directory (Whoosh)
+INDEX_DIR = OUTPUT_DIR / "index"
+
 # Make sure they exist
 for d in (INPUT_DIR, OCR_DIR, OUTPUT_DIR, LOG_DIR, DATA_DIR):
     d.mkdir(parents=True, exist_ok=True)
