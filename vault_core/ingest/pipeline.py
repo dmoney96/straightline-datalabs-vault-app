@@ -26,21 +26,25 @@ def build_provenance_record(
     txt_path: Path,
     source_url: Optional[str],
     kind: str,
+    case: Optional[str] = None,
 ) -> Dict[str, str]:
     """
     Normalize how we describe one ingested document.
 
     We store simple string paths so the manifest stays portable / JSON-friendly.
     """
-    return {
+    record: Dict[str, str] = {
         "kind": kind,
         "pdf": str(pdf_path),
         "txt": str(txt_path),
         "source_url": source_url,
     }
+    if case:
+        record["case"] = case
+    return record
 
 
-def ingest_source(source: str) -> Tuple[Path, Path]:
+def ingest_source(source: str, case: Optional[str] = None) -> Tuple[Path, Path]:
     """
     High-level ingest step:
 
@@ -63,11 +67,15 @@ def ingest_source(source: str) -> Tuple[Path, Path]:
     else:
         log.info("Ingesting local file: %s", source)
         pdf_path = Path(source)
+
+        # If it's not absolute, treat as relative to INPUT_DIR.
         if not pdf_path.is_absolute():
             pdf_path = INPUT_DIR / pdf_path
+
         pdf_path = pdf_path.resolve()
         if not pdf_path.exists():
             raise FileNotFoundError(f"{pdf_path} does not exist")
+
         kind = "local_file"
         source_url = None
 
@@ -83,6 +91,7 @@ def ingest_source(source: str) -> Tuple[Path, Path]:
         txt_path=txt_path,
         source_url=source_url,
         kind=kind,
+        case=case,
     )
     append_manifest_entry(prov)
 
