@@ -1,0 +1,760 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+from collections import defaultdict
+from pathlib import Path
+import sys
+import re
+import io
+import csv
+from urllib.parse import urlparse, parse_qs, unquote
+
+import requests
+from bs4 import BeautifulSoup
+from flask import Flask, request, render_template_string, abort
+
+# Optional DOCX support
+try:
+    from docx import Document  # type: ignore[import]
+except ImportError:  # pragma: no cover - handled at runtime
+    Document = None
+
+# Ensure project root is on sys.path
+ROOT = Path(__file__).resolve().parents[1]
+if str(ROOT) not in sys.path:
+    sys.path.insert(0, str(ROOT))
+
+from vault_core.search_backend import run_search  # type: ignore[import]
+from vault_core.manifest import iter_manifest, append_manifest_entry  # type: ignore[import]
+from vault_core.ingest.pipeline import ingest_source  # type: ignore[import]
+from vault_core.paths import DATA_DIR, OCR_DIR  # type: ignore[import]
+
+app = Flask(__name__)
+
+# ---------- Web search helpers ----------
+
+DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/html/"
+
+
+def _extract_real_url(href: str) -> str:
+    """
+    DuckDuckGo often wraps outbound links as /l/?uddg=<encoded_url>.
+    This helper unwraps those when present.
+    """
+    if href.startswith("/"):
+        parsed = urlparse(href)
+        qs = parse_qs(parsed.query)
+        if "uddg" in qs and qs["uddg"]:
+            return unquote(qs["uddg"][0])
+    return href
+
+
+def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
+    """
+    Use DuckDuckGo's HTML endpoint to find outbound URLs.
+
+    Strategy:
+      1. Look specifically for main result links (a.result__a, a[data-testid]).
+      2. If that yields nothing, fall back to any external http(s) links.
+    """
+    params = {"q": query, "kl": "us-en"}
+    headers = {
+        "User-Agent": "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)",
+    }
+
+    resp = requests.get(DUCKDUCKGO_SEARCH_URL, params=params, headers=headers, timeout=20)
+    resp.raise_for_status()
+
+    soup = BeautifulSoup(resp.text, "html.parser")
+    urls: list[str] = []
+
+    # --- Primary: DDG web results ---
+    for a in soup.select("a.result__a, a[data-testid='result-title-a']"):
+        raw_href = a.get("href")
+        if not raw_href:
+            continue
+
+        href = _extract_real_url(raw_href)
+        if not href.startswith("http"):
+            continue
+
+        parsed = urlparse(href)
+        netloc = (parsed.netloc or "").lower()
+
+        # Skip internal DuckDuckGo links AFTER trying to unwrap uddg
+        if "duckduckgo.com" in netloc:
+            continue
+
+        if href not in urls:
+            urls.append(href)
+
+        if len(urls) >= limit:
+            return urls
+
+    # --- Fallback: any external http(s) link on the page ---
+    if not urls:
+        for a in soup.find_all("a", href=True):
+            raw_href = a["href"]
+            href = _extract_real_url(raw_href)
+
+            if not href.startswith("http"):
+                continue
+
+            parsed = urlparse(href)
+            netloc = (parsed.netloc or "").lower()
+
+            if "duckduckgo.com" in netloc:
+                continue
+
+            if href not in urls:
+                urls.append(href)
+
+            if len(urls) >= limit:
+                break
+
+    return urls
+
+
+# ---------- Ingest helpers for ANY URL ----------
+
+
+def _slug_from_url(url: str) -> str:
+    """
+    Turn a URL into a filesystem-safe slug for TXT filenames.
+    """
+    parsed = urlparse(url)
+    base = (parsed.netloc + parsed.path).lower()
+    slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
+    return slug or "web_doc"
+
+
+def _write_txt_and_manifest(
+    text: str,
+    url: str,
+    case: str | None,
+    kind: str,
+) -> Path:
+    """
+    Write text into OCR_DIR as a .txt file and append a manifest entry.
+    Returns the txt_path.
+    """
+    OCR_DIR.mkdir(parents=True, exist_ok=True)
+
+    slug = _slug_from_url(url)
+    txt_path = OCR_DIR / f"{slug}.txt"
+    txt_path.write_text(text, encoding="utf-8")
+
+    # Store txt path relative to DATA_DIR if possible (keeps vault relocatable)
+    try:
+        txt_rel = txt_path.relative_to(DATA_DIR)
+    except ValueError:
+        txt_rel = txt_path
+
+    entry = {
+        "kind": kind,
+        "pdf": None,
+        "txt": str(txt_rel),
+        "source_url": url,
+    }
+    if case:
+        entry["case"] = case
+
+    append_manifest_entry(entry)
+    return txt_path
+
+
+def _extract_docx_text(content: bytes) -> str:
+    """
+    Extract plain text from a DOCX file (in-memory bytes) using python-docx.
+    """
+    if Document is None:
+        raise RuntimeError(
+            "python-docx is not installed. Install it with 'pip install python-docx'."
+        )
+
+    with io.BytesIO(content) as buf:
+        doc = Document(buf)
+    parts: list[str] = []
+    for para in doc.paragraphs:
+        text = para.text.strip()
+        if text:
+            parts.append(text)
+    return "\n".join(parts)
+
+
+def _extract_csv_text(text: str) -> str:
+    """
+    Flatten CSV text into a readable, line-based text block for indexing.
+    Keeps it simple: join cells with tabs and rows with newlines.
+    """
+    out_lines: list[str] = []
+    reader = csv.reader(text.splitlines())
+    for row in reader:
+        out_lines.append("\t".join(cell.strip() for cell in row))
+    return "\n".join(out_lines)
+
+
+def ingest_url_web(url: str, case: str | None):
+    """
+    Ingest an arbitrary URL:
+      - If it's a PDF -> delegate to ingest_source (existing pipeline).
+      - If it's DOCX -> extract text via python-docx -> web_docx.
+      - If it's CSV -> flatten rows -> web_csv.
+      - If it's HTML -> strip to text and record as web_html.
+      - If it's text/* -> record as web_text.
+      - Otherwise -> raise ValueError so the UI can show an error.
+
+    Returns (pdf_path, txt_path) where pdf_path may be None.
+    """
+    headers = {
+        "User-Agent": "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)",
+    }
+
+    # Try HEAD first to inspect content-type
+    try:
+        head_resp = requests.head(
+            url,
+            headers=headers,
+            timeout=15,
+            allow_redirects=True,
+        )
+        ctype = (head_resp.headers.get("Content-Type") or "").lower()
+    except Exception:
+        head_resp = None
+        ctype = ""
+
+    # ---- PDF: existing pipeline
+    if "pdf" in ctype or url.lower().endswith(".pdf"):
+        pdf_path, txt_path = ingest_source(url, case=case)
+        return pdf_path, txt_path
+
+    # Fetch body for everything else
+    resp = requests.get(url, headers=headers, timeout=30)
+    resp.raise_for_status()
+    if not ctype:
+        ctype = (resp.headers.get("Content-Type") or "").lower()
+
+    # ---- DOCX
+    if (
+        "officedocument.wordprocessingml.document" in ctype
+        or url.lower().endswith(".docx")
+    ):
+        text = _extract_docx_text(resp.content)
+        txt_path = _write_txt_and_manifest(text, url, case, kind="web_docx")
+        return None, txt_path
+
+    # ---- CSV
+    if "text/csv" in ctype or url.lower().endswith(".csv"):
+        raw_text = resp.text
+        text = _extract_csv_text(raw_text)
+        txt_path = _write_txt_and_manifest(text, url, case, kind="web_csv")
+        return None, txt_path
+
+    # ---- HTML
+    if "html" in ctype or url.lower().endswith((".htm", ".html", "/")):
+        soup = BeautifulSoup(resp.text, "html.parser")
+        text = soup.get_text("\n", strip=True)
+        txt_path = _write_txt_and_manifest(text, url, case, kind="web_html")
+        return None, txt_path
+
+    # ---- Generic text/*
+    if ctype.startswith("text/"):
+        text = resp.text
+        txt_path = _write_txt_and_manifest(text, url, case, kind="web_text")
+        return None, txt_path
+
+    # ---- Fallback: unsupported for now
+    raise ValueError(f"Unsupported content type for web ingest: {ctype or 'unknown'}")
+
+
+# ---------- Base Styles ----------
+
+BASE_STYLE = """
+<style>
+  body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; max-width: 960px; }
+  h1 { margin-bottom: 0.25rem; }
+  h2 { margin-top: 1.5rem; }
+  a { text-decoration: none; }
+  a:hover { text-decoration: underline; }
+  form { margin-bottom: 1.5rem; }
+  label { display: inline-block; min-width: 4.5rem; }
+  input[type="text"] { width: 25rem; }
+  .meta { color: #555; font-size: 0.9rem; }
+  .result { border-bottom: 1px solid #ccc; padding: 0.75rem 0; }
+  .snippet { margin-top: 0.5rem; }
+  .score { font-size: 0.85rem; color: #666; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
+  nav a { margin-right: 1rem; font-size: 0.95rem; }
+  table { border-collapse: collapse; width: 100%; }
+  th, td { border-bottom: 1px solid #ddd; padding: 0.4rem 0.25rem; text-align: left; }
+  th { font-weight: 600; }
+  pre { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.9rem; }
+  .error { color: #b00020; margin-top: 0.5rem; }
+  .ingested-item { border-bottom: 1px solid #ccc; padding: 0.5rem 0; }
+</style>
+"""
+
+# ---------- Templates ----------
+
+INDEX_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8"><title>Straightline Vault Search</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
+
+<h1>Straightline Vault</h1>
+<p class="meta">Full-text search across your ingested cases.</p>
+
+<form method="get" action="/">
+  <div>
+    <label for="q">Query</label>
+    <input type="text" id="q" name="q" value="{{ q|e }}" autofocus>
+  </div>
+  <div>
+    <label for="case">Case</label>
+    <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="optional">
+  </div>
+  <div>
+    <label for="kind">Kind</label>
+    <input type="text" id="kind" name="kind" value="{{ kind|e }}" placeholder="local_file, url_fetch, web_html">
+  </div>
+  <div style="margin-top: 0.5rem;">
+    <label for="limit">Limit</label>
+    <input type="number" id="limit" name="limit" value="{{ limit }}">
+    <button type="submit">Search</button>
+  </div>
+</form>
+
+{% if q %}
+  <h2>Results for <code>{{ q }}</code></h2>
+  {% if results %}
+    <p class="meta">{{ results|length }} result(s) shown.</p>
+    {% for r in results %}
+      <div class="result">
+        <div>
+          <strong><a href="/doc/{{ r.doc_id }}">{{ r.doc_id }}</a></strong>
+          <span class="score">(score={{ "%.2f"|format(r.score) }})</span>
+        </div>
+        <div class="meta">
+          Source: <code>{{ r.source }}</code>
+          {% if r.case or r.kind %}
+            —
+            {% if r.case %}case={{ r.case }}{% endif %}
+            {% if r.kind %} kind={{ r.kind }}{% endif %}
+          {% endif %}
+        </div>
+        <div class="snippet">{{ r.snippet|safe }}</div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <p>No results found.</p>
+  {% endif %}
+{% endif %}
+</body></html>
+"""
+
+CASES_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8"><title>Straightline Vault — Cases</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
+
+<h1>Cases</h1>
+<p class="meta">Overview of all cases in the manifest.</p>
+
+{% if not cases %}
+  <p>No cases found.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr><th>Case</th><th>Total docs</th><th>Kind breakdown</th></tr>
+    </thead>
+    <tbody>
+      {% for case_name, info in cases %}
+        <tr>
+          <td><a href="/case/{{ case_name }}">{{ case_name }}</a></td>
+          <td>{{ info.total }}</td>
+          <td>
+            {% for kind, count in info.kinds.items() %}
+              {{ kind }}={{ count }}{% if not loop.last %}, {% endif %}
+            {% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+</body></html>
+"""
+
+CASE_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8"><title>Straightline Vault — Case {{ case_name }}</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
+
+<h1>Case: {{ case_name }}</h1>
+<p class="meta">
+  {{ docs|length }} document(s) in this case.
+  —
+  <a href="/?case={{ case_name|e }}">Search within this case</a>
+</p>
+
+{% if not docs %}
+  <p>No documents found for this case.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr><th>Doc ID</th><th>Kind</th><th>PDF</th><th>Source URL</th></tr>
+    </thead>
+    <tbody>
+      {% for d in docs %}
+        <tr>
+          <td><a href="/doc/{{ d.doc_id }}">{{ d.doc_id }}</a></td>
+          <td>{{ d.kind or "" }}</td>
+          <td><code>{{ d.pdf or "" }}</code></td>
+          <td>{% if d.source_url %}<code>{{ d.source_url }}</code>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+</body></html>
+"""
+
+DOC_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Straightline Vault — {{ doc_id }}</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  {% if case_name %}
+    <a href="/case/{{ case_name }}">Back to case</a>
+  {% endif %}
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
+
+<h1>Document: {{ doc_id }}</h1>
+<p class="meta">
+  {% if case_name %}case={{ case_name }} — {% endif %}
+  {% if kind %}kind={{ kind }} — {% endif %}
+  {% if pdf %}PDF: <code>{{ pdf }}</code> — {% endif %}
+  {% if source_url %}Source URL: <code>{{ source_url }}</code>{% endif %}
+</p>
+
+<h2>OCR Text</h2>
+{% if error %}
+  <p class="meta">Error reading OCR text: {{ error }}</p>
+{% else %}
+  <pre>{{ content }}</pre>
+{% endif %}
+</body></html>
+"""
+
+WEB_INGEST_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<title>Straightline Vault — Web Ingest</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
+
+<h1>Web Ingest</h1>
+<p class="meta">
+  Search the public web for documents (PDF, HTML, text, DOCX, CSV) and ingest them into a case.
+  PDFs go through the existing pipeline; other types are converted to text and stored.
+</p>
+
+<form method="post" action="/web-ingest">
+  <div>
+    <label for="q">Query</label>
+    <input type="text" id="q" name="q" value="{{ query|e }}" placeholder="e.g. IRS publication 463">
+  </div>
+
+  <div>
+    <label for="case">Case (optional)</label>
+    <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="auto if blank">
+  </div>
+
+  <div>
+    <label for="limit">Limit</label>
+    <input type="number" id="limit" name="limit" value="{{ limit }}">
+    <button type="submit">Search &amp; Ingest</button>
+  </div>
+
+  {% if error %}
+    <div class="error">{{ error }}</div>
+  {% endif %}
+</form>
+
+{% if pdf_urls %}
+  <h2>URLs Found</h2>
+  <ul>
+    {% for u in pdf_urls %}
+      <li><code>{{ u }}</code></li>
+    {% endfor %}
+  </ul>
+{% endif %}
+
+{% if ingested %}
+  <h2>Ingest Results</h2>
+  <p class="meta">Case: <strong>{{ case }}</strong></p>
+  {% for item in ingested %}
+    <div class="ingested-item">
+      <div><strong>URL:</strong> <code>{{ item.url }}</code></div>
+      {% if item.error %}
+        <div class="error"><strong>Error:</strong> {{ item.error }}</div>
+      {% else %}
+        {% if item.pdf_path %}
+          <div>PDF: <code>{{ item.pdf_path }}</code></div>
+        {% endif %}
+        {% if item.txt_path %}
+          <div>TXT: <code>{{ item.txt_path }}</code></div>
+        {% endif %}
+        {% if not item.pdf_path and not item.txt_path %}
+          <div class="meta">No paths recorded (unexpected).</div>
+        {% endif %}
+      {% endif %}
+    </div>
+  {% endfor %}
+{% endif %}
+
+</body></html>
+"""
+
+# ---------- Helpers ----------
+
+
+def build_case_stats():
+    stats = defaultdict(lambda: {"total": 0, "kinds": defaultdict(int)})
+    for rec in iter_manifest() or []:
+        case = rec.get("case") or "uncategorized"
+        kind = rec.get("kind") or "unknown"
+        stats[case]["total"] += 1
+        stats[case]["kinds"][kind] += 1
+    return sorted(
+        ((name, {"total": info["total"], "kinds": dict(info["kinds"])})
+         for name, info in stats.items()),
+        key=lambda x: x[0],
+    )
+
+
+def find_manifest_by_doc_id(doc_id: str):
+    for rec in iter_manifest() or []:
+        txt = rec.get("txt")
+        if not txt:
+            continue
+        p = Path(txt)
+        if p.stem == doc_id:
+            return rec
+    return None
+
+
+def load_ocr_text(path_str: str):
+    try:
+        p = Path(path_str)
+        if not p.is_absolute():
+            p = ROOT / p
+        text = p.read_text(encoding="utf-8", errors="replace")
+        return text, None
+    except Exception as e:
+        return None, str(e)
+
+
+# ---------- Routes ----------
+
+
+@app.route("/", methods=["GET"])
+def index():
+    q = request.args.get("q", "").strip()
+    case = request.args.get("case", "").strip() or None
+    kind = request.args.get("kind", "").strip() or None
+    limit_str = request.args.get("limit", "") or "20"
+
+    try:
+        limit = int(limit_str)
+    except ValueError:
+        limit = 20
+
+    results = run_search(q, case=case, kind=kind, limit=limit) if q else []
+
+    return render_template_string(
+        INDEX_TEMPLATE,
+        style=BASE_STYLE,
+        q=q,
+        case=case or "",
+        kind=kind or "",
+        limit=limit,
+        results=results,
+    )
+
+
+@app.route("/cases", methods=["GET"])
+def cases_view():
+    return render_template_string(
+        CASES_TEMPLATE,
+        style=BASE_STYLE,
+        cases=build_case_stats(),
+    )
+
+
+@app.route("/case/<case_name>", methods=["GET"])
+def case_view(case_name: str):
+    docs = []
+    for rec in iter_manifest() or []:
+        if (rec.get("case") or "uncategorized") != case_name:
+            continue
+
+        txt = rec.get("txt")
+        pdf = rec.get("pdf")
+        source_url = rec.get("source_url")
+
+        if not txt:
+            continue
+
+        p = Path(txt)
+        docs.append(
+            {
+                "doc_id": p.stem,
+                "kind": rec.get("kind"),
+                "pdf": pdf,
+                "source_url": source_url,
+            }
+        )
+
+    return render_template_string(
+        CASE_TEMPLATE,
+        style=BASE_STYLE,
+        case_name=case_name,
+        docs=docs,
+    )
+
+
+@app.route("/doc/<doc_id>", methods=["GET"])
+def doc_view(doc_id: str):
+    rec = find_manifest_by_doc_id(doc_id)
+    if not rec:
+        abort(404, description=f"No manifest record found for doc_id={doc_id!r}")
+
+    txt_path = rec.get("txt")
+    content, error = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing.")
+
+    return render_template_string(
+        DOC_TEMPLATE,
+        style=BASE_STYLE,
+        doc_id=doc_id,
+        case_name=rec.get("case"),
+        kind=rec.get("kind"),
+        pdf=rec.get("pdf"),
+        source_url=rec.get("source_url"),
+        content=content,
+        error=error,
+    )
+
+
+@app.route("/web-ingest", methods=["GET", "POST"])
+def web_ingest():
+    query = ""
+    case = ""
+    limit = 5
+    error: str | None = None
+    pdf_urls: list[str] = []
+    ingested: list[dict] = []
+
+    if request.method == "POST":
+        query = (request.form.get("q") or "").strip()
+        case = (request.form.get("case") or "").strip()
+        limit_raw = (request.form.get("limit") or "").strip()
+
+        try:
+            limit = int(limit_raw) if limit_raw else 5
+        except ValueError:
+            error = "Limit must be an integer."
+            limit = 5
+
+        if not error:
+            if not query:
+                error = "Query is required."
+            else:
+                # Auto-generate case if blank
+                if not case:
+                    slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
+                    case = f"{slug}_web" if slug else "web"
+
+                try:
+                    pdf_urls = fetch_doc_urls(query, limit=limit)
+                except Exception as e:
+                    error = f"Web search failed: {e}"
+
+                if not error and not pdf_urls:
+                    error = "No document-like URLs found in search results."
+
+                if not error:
+                    for url in pdf_urls:
+                        try:
+                            pdf_path, txt_path = ingest_url_web(url, case=case)
+                            ingested.append(
+                                {
+                                    "url": url,
+                                    "pdf_path": str(pdf_path) if pdf_path else None,
+                                    "txt_path": str(txt_path) if txt_path else None,
+                                    "error": None,
+                                }
+                            )
+                        except Exception as e:
+                            ingested.append(
+                                {
+                                    "url": url,
+                                    "pdf_path": None,
+                                    "txt_path": None,
+                                    "error": str(e),
+                                }
+                            )
+
+    return render_template_string(
+        WEB_INGEST_TEMPLATE,
+        style=BASE_STYLE,
+        query=query,
+        case=case,
+        limit=limit,
+        error=error,
+        pdf_urls=pdf_urls,
+        ingested=ingested,
+    )
+
+
+if __name__ == "__main__":
+    # Dev mode only; production should use gunicorn/uvicorn behind nginx.
+    app.run(host="127.0.0.1", port=5001, debug=True)

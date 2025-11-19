@@ -23,3 +23,10 @@ logs/
 .DS_Store
 *.swp
 *.swo
+
+# Vault runtime data
+data/
+ocr/
+input/
+logs/
+*.log
