@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Iterator
 from datetime import datetime
 
 from vault_core.paths import DATA_DIR
@@ -30,7 +30,7 @@ def append_manifest_entry(entry: Dict[str, Any]) -> None:
         f.write(json.dumps(record, ensure_ascii=False) + "\n")
 
 
-def iter_manifest():
+def iter_manifest() -> Iterator[Dict[str, Any]]:
     """
     Generator that yields each manifest record as a dict.
     Ignores malformed JSON lines.
@@ -49,4 +49,17 @@ def iter_manifest():
                 continue
 
 
-__all__ = ["append_manifest_entry", "iter_manifest"]
+def summarize_cases() -> Dict[str, int]:
+    """
+    Return a dict of {case_name: count_of_documents} based on the manifest.
+
+    If a record has no 'case' field, it is grouped under 'uncategorized'.
+    """
+    counts: Dict[str, int] = {}
+    for rec in iter_manifest():
+        case = rec.get("case") or "uncategorized"
+        counts[case] = counts.get(case, 0) + 1
+    return counts
+
+
+__all__ = ["append_manifest_entry", "iter_manifest", "summarize_cases"]

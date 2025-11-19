@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import annotations
 
 import argparse
 import sys
@@ -12,55 +13,83 @@ if str(ROOT) not in sys.path:
 from vault_core.ingest.pipeline import ingest_source  # type: ignore[import]
 
 
-def iter_pdfs(root: Path):
-    """Yield all .pdf files under root, sorted."""
-    for path in sorted(root.rglob("*.pdf")):
-        yield path
+def iter_sources_from_file(path: Path):
+    """
+    Yield non-empty, non-comment lines from a text file.
+    Lines starting with '#' are ignored.
+    """
+    with path.open("r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            yield line
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Bulk-ingest a directory of PDFs into Straightline Vault."
+        description="Bulk-ingest a list of URLs and/or file paths into Straightline Vault."
     )
     parser.add_argument(
-        "directory",
-        help="Directory containing PDFs (e.g. input/1320_pages).",
+        "list_file",
+        help="Path to a text file containing one URL or file path per line.",
     )
     parser.add_argument(
         "--case",
-        help="Optional case identifier applied to all ingested files.",
+        help="Optional case identifier applied to all ingested items (e.g. epstein_1320, irs_travel).",
         default=None,
+    )
+    parser.add_argument(
+        "--stop-on-error",
+        action="store_true",
+        help="Stop immediately on first error instead of continuing.",
     )
 
     args = parser.parse_args()
 
-    root = Path(args.directory).resolve()
-    if not root.exists() or not root.is_dir():
-        print(f"[ERROR] {root} is not a directory", file=sys.stderr)
-        sys.exit(1)
+    list_path = Path(args.list_file)
+    if not list_path.exists():
+        print(f"[ERROR] list file does not exist: {list_path}", file=sys.stderr)
+        raise SystemExit(1)
 
     total = 0
-    ok = 0
-    failed = 0
+    successes = 0
+    failures = 0
 
-    for pdf in iter_pdfs(root):
+    print(f"[INFO] Starting bulk ingest from {list_path} (case={args.case or 'none'})")
+
+    for source in iter_sources_from_file(list_path):
         total += 1
-        rel = pdf.relative_to(root)
-        print(f"[INFO] Ingesting {rel} ...")
-        try:
-            ingest_source(str(pdf), case=args.case)
-            ok += 1
-        except FileNotFoundError as e:
-            print(f"[ERROR] {rel}: {e}", file=sys.stderr)
-            failed += 1
-        except Exception as e:  # noqa: BLE001
-            print(f"[ERROR] {rel}: unexpected error: {e}", file=sys.stderr)
-            failed += 1
+        print(f"\n[{total}] Ingesting: {source!r}")
 
-    print()
-    print(f"[SUMMARY] processed={total} ok={ok} failed={failed}")
-    if failed:
-        sys.exit(1)
+        try:
+            pdf_path, txt_path = ingest_source(source, case=args.case)
+        except FileNotFoundError as e:
+            failures += 1
+            print(f"[ERROR] File not found for {source!r}: {e}", file=sys.stderr)
+            if args.stop_on_error:
+                break
+            continue
+        except Exception as e:  # noqa: BLE001
+            failures += 1
+            print(f"[ERROR] Unexpected ingest error for {source!r}: {e}", file=sys.stderr)
+            if args.stop_on_error:
+                break
+            continue
+
+        successes += 1
+        print("  -> Ingested:")
+        print(f"       pdf: {pdf_path}")
+        print(f"       txt: {txt_path}")
+
+    print("\n[SUMMARY]")
+    print(f"  Total:     {total}")
+    print(f"  Successes: {successes}")
+    print(f"  Failures:  {failures}")
+
+    if failures > 0:
+        raise SystemExit(1)
+    raise SystemExit(0)
 
 
 if __name__ == "__main__":

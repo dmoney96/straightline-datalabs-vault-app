@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+from __future__ import annotations
 
 import argparse
 import sys
@@ -37,7 +38,7 @@ def normalize_pdf_arg(arg: str) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Ingest a single PDF into Straightline Vault."
+        description="Ingest a single local PDF into Straightline Vault."
     )
     parser.add_argument(
         "pdf",
@@ -51,7 +52,7 @@ def main() -> None:
 
     args = parser.parse_args()
 
-    # Normalize the CLI arg before handing off to ingest_source
+    # Normalize for ingest pipeline
     source = normalize_pdf_arg(args.pdf)
 
     try:
@@ -64,10 +65,9 @@ def main() -> None:
         sys.exit(1)
 
     print("Ingested:")
-    print(f"  pdf: {pdf_path}")
-    print(f"  txt: {txt_path}")
-    if args.case:
-        print(f"  case: {args.case}")
+    print(f"  pdf:  {pdf_path}")
+    print(f"  txt:  {txt_path}")
+    print(f"  case: {args.case or 'none'}")
 
 
 if __name__ == "__main__":
