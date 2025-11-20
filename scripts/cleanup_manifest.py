@@ -1,85 +1,178 @@
+#!/usr/bin/env python
 from __future__ import annotations
 
+import argparse
 import json
 import sys
+from collections import defaultdict
 from pathlib import Path
 
-# --- Make project root importable so "vault_core" works ---
+# Make sure project root is on sys.path so "vault_core" is importable
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vault_core.manifest import MANIFEST_PATH  # now this import should succeed
+from vault_core.manifest import iter_manifest, MANIFEST_PATH  # type: ignore[import]
 
 
-def is_good_record(rec: dict) -> bool:
+def load_raw_lines(path: Path) -> list[str]:
+    if not path.exists():
+        return []
+    return path.read_text(encoding="utf-8").splitlines()
+
+
+def parse_entries(lines: list[str]) -> list[dict]:
+    entries: list[dict] = []
+    for idx, line in enumerate(lines, start=1):
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            rec = json.loads(line)
+        except json.JSONDecodeError:
+            print(f"[WARN] Skipping malformed JSON on line {idx}", file=sys.stderr)
+            continue
+        if not isinstance(rec, dict):
+            print(f"[WARN] Non-dict JSON on line {idx}, skipping", file=sys.stderr)
+            continue
+        entries.append(rec)
+    return entries
+
+
+def compute_dedup_key(rec: dict) -> tuple:
     """
-    Decide whether a manifest record is worth keeping.
+    Build a key that identifies 'the same logical record'.
 
-    Right now we:
-      - require a dict
-      - drop entries where *both* pdf and txt are missing
-      - drop entries where everything is basically None
+    We use:
+      - kind
+      - case
+      - pdf
+      - txt
+      - source_url
 
-    You can tighten this later if you want.
+    Two entries with identical keys are considered duplicates,
+    and only the first one will be kept.
     """
-    if not isinstance(rec, dict):
-        return False
+    return (
+        rec.get("kind"),
+        rec.get("case"),
+        rec.get("pdf"),
+        rec.get("txt"),
+        rec.get("source_url"),
+    )
 
-    pdf = rec.get("pdf")
-    txt = rec.get("txt")
-    source_url = rec.get("source_url")
+
+def should_drop_legacy_kind_case_anomaly(rec: dict, pdf_to_cases: dict[str, set[str]]) -> bool:
+    """
+    Handle the specific historical weirdness you saw:
+
+      kind = "epstein_1320", case = None, same pdf/txt as a proper local_file entry.
+
+    If:
+      - case is None
+      - kind is not one of the expected 'kind' values
+      - and we see another entry with the same PDF but a valid case,
+    then we consider this a legacy duplicate/anomaly and drop it.
+    """
+    case = rec.get("case")
     kind = rec.get("kind")
+    pdf = rec.get("pdf")
 
-    # If it has neither pdf nor txt, it's probably not useful
-    if not pdf and not txt:
+    if case is not None:
         return False
 
-    # If everything is None/empty, also drop
-    if not any([pdf, txt, source_url, kind]):
+    # "Normal" kinds we expect
+    expected_kinds = {"local_file", "url_fetch", "test_record"}
+
+    if kind in expected_kinds:
         return False
 
-    return True
+    if not pdf:
+        return False
+
+    # If this PDF is already associated with at least one case,
+    # and this record has a funky 'kind' that looks like a case name,
+    # we treat it as an anomaly.
+    cases_for_pdf = pdf_to_cases.get(str(pdf), set())
+    if cases_for_pdf:
+        return True
+
+    return False
+
+
+def cleanup_manifest(dry_run: bool = False) -> None:
+    raw_lines = load_raw_lines(MANIFEST_PATH)
+    if not raw_lines:
+        print("[INFO] No manifest.jsonl found or file is empty.")
+        return
+
+    entries = parse_entries(raw_lines)
+    if not entries:
+        print("[INFO] Manifest has no valid JSON entries.")
+        return
+
+    print(f"[INFO] Loaded {len(entries)} manifest entries from {MANIFEST_PATH}")
+
+    # Build a mapping from PDF → set(cases) for anomaly detection
+    pdf_to_cases: dict[str, set[str]] = defaultdict(set)
+    for rec in entries:
+        pdf = rec.get("pdf")
+        case = rec.get("case")
+        if pdf and case:
+            pdf_to_cases[str(pdf)].add(str(case))
+
+    seen_keys: set[tuple] = set()
+    cleaned: list[dict] = []
+    dropped_duplicates = 0
+    dropped_anomalies = 0
+
+    for rec in entries:
+        key = compute_dedup_key(rec)
+
+        # Legacy anomaly handling (kind=case, case=None)
+        if should_drop_legacy_kind_case_anomaly(rec, pdf_to_cases):
+            dropped_anomalies += 1
+            continue
+
+        if key in seen_keys:
+            dropped_duplicates += 1
+            continue
+
+        seen_keys.add(key)
+        cleaned.append(rec)
+
+    print(f"[INFO] After cleanup: {len(cleaned)} entries")
+    print(f"[INFO] Dropped {dropped_duplicates} exact duplicates")
+    print(f"[INFO] Dropped {dropped_anomalies} legacy kind/case anomalies")
+
+    if dry_run:
+        print("[INFO] Dry run: not writing changes to disk.")
+        return
+
+    # Write back to manifest.jsonl
+    backup_path = MANIFEST_PATH.with_suffix(".jsonl.bak")
+    MANIFEST_PATH.replace(backup_path)
+    print(f"[INFO] Backed up original manifest to {backup_path}")
+
+    with MANIFEST_PATH.open("w", encoding="utf-8") as f:
+        for rec in cleaned:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+
+    print(f"[INFO] Wrote cleaned manifest to {MANIFEST_PATH}")
 
 
 def main() -> None:
-    if not MANIFEST_PATH.exists():
-        print(f"No manifest file at {MANIFEST_PATH}, nothing to clean.")
-        return
+    parser = argparse.ArgumentParser(
+        description="Clean up manifest.jsonl (deduplicate & remove legacy anomalies)."
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Show what would be done without modifying manifest.jsonl.",
+    )
+    args = parser.parse_args()
 
-    # Backup first
-    backup_path = MANIFEST_PATH.with_suffix(".jsonl.bak")
-    backup_path.write_text(MANIFEST_PATH.read_text(encoding="utf-8"), encoding="utf-8")
-    print(f"Backed up original manifest to {backup_path}")
-
-    kept = []
-    dropped = 0
-
-    with MANIFEST_PATH.open("r", encoding="utf-8") as f:
-        for line in f:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-            except json.JSONDecodeError:
-                dropped += 1
-                continue
-
-            if is_good_record(rec):
-                kept.append(rec)
-            else:
-                dropped += 1
-
-    with MANIFEST_PATH.open("w", encoding="utf-8") as f:
-        for rec in kept:
-            json.dump(rec, f, ensure_ascii=False)
-            f.write("\n")
-
-    print("Cleanup complete.")
-    print(f"  Kept:    {len(kept)} records")
-    print(f"  Dropped: {dropped} records")
-    print(f"  Manifest: {MANIFEST_PATH}")
+    cleanup_manifest(dry_run=args.dry_run)
 
 
 if __name__ == "__main__":

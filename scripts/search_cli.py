@@ -1,51 +1,72 @@
-import sys
-from whoosh.index import open_dir
-from whoosh.qparser import QueryParser
-from whoosh import scoring
+#!/usr/bin/env python
+from __future__ import annotations
 
-from paths import OUTPUT_DIR
+import argparse
+from typing import Optional
 
-INDEX_DIR = OUTPUT_DIR / "index"
+from vault_core.search_backend import run_search  # type: ignore[import]
 
 
-def main():
-    if len(sys.argv) < 2:
-        print("Usage: python scripts/search_cli.py <query terms...>")
-        sys.exit(1)
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Search Straightline Vault index from the command line."
+    )
+    parser.add_argument(
+        "query",
+        nargs="+",
+        help="Search terms (e.g. 'massage table' or 'flight logs').",
+    )
+    parser.add_argument(
+        "--case",
+        help="Filter results to a specific case name (e.g. maxwell_1320, irs_travel).",
+        default=None,
+    )
+    parser.add_argument(
+        "--kind",
+        help="Filter results by manifest kind (e.g. local_file, url_fetch).",
+        default=None,
+    )
+    parser.add_argument(
+        "--limit",
+        type=int,
+        default=20,
+        help="Maximum number of matching results to display (after filtering).",
+    )
 
-    query_text = " ".join(sys.argv[1:])
-    print(f"🔎 Searching for: {query_text!r}\n")
+    args = parser.parse_args()
+    query_text = " ".join(args.query)
 
-    ix = open_dir(INDEX_DIR)
+    print(f"🔎 Searching for: {query_text!r}")
+    if args.case:
+        print(f"   (case filter: {args.case})")
+    if args.kind:
+        print(f"   (kind filter: {args.kind})")
+    print()
 
-    with ix.searcher(weighting=scoring.BM25F()) as searcher:
-        parser = QueryParser("content", schema=ix.schema)
-        query = parser.parse(query_text)
-        results = searcher.search(query, limit=20)
+    results = run_search(
+        query_text=query_text,
+        case=args.case or None,
+        kind=args.kind or None,
+        limit=args.limit,
+    )
 
-        if not results:
-            print("No results found.")
-            return
+    if not results:
+        print("No results found.")
+        return
 
-        for hit in results:
-            doc_id = hit.get("doc_id", "unknown")
-            source = hit.get("source_file", "unknown")
-            score = hit.score
+    for r in results:
+        meta_bits = []
+        if r["case"]:
+            meta_bits.append(f"case={r['case']}")
+        if r["kind"]:
+            meta_bits.append(f"kind={r['kind']}")
+        meta_str = f" [{' '.join(meta_bits)}]" if meta_bits else ""
 
-            print(f"📄 {doc_id}  (score={score:.2f})")
-            print(f"    Source: {source}")
-            print("-" * 80)
-
-            try:
-                snippet = hit.highlights("content", top=3)
-            except KeyError:
-                snippet = "(content not stored in index; search worked, but no snippet is available with current schema)"
-
-            if not snippet:
-                snippet = (hit.get("content", "") or "")[:300]
-
-            print(snippet)
-            print()
+        print(f"📄 {r['doc_id']}  (score={r['score']:.2f}){meta_str}")
+        print(f"    Source: {r['source']}")
+        print("-" * 80)
+        print(r["snippet"])
+        print()
 
 
 if __name__ == "__main__":

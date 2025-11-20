@@ -7,16 +7,26 @@ import sys
 import re
 import io
 import csv
+import os
+from functools import wraps
 from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
 from bs4 import BeautifulSoup
-from flask import Flask, request, render_template_string, abort
+from flask import (
+    Flask,
+    request,
+    render_template_string,
+    abort,
+    redirect,
+    url_for,
+    session,
+)
 
 # Optional DOCX support
 try:
     from docx import Document  # type: ignore[import]
-except ImportError:  # pragma: no cover - handled at runtime
+except ImportError:  # pragma: no cover
     Document = None
 
 # Ensure project root is on sys.path
@@ -31,6 +41,33 @@ from vault_core.paths import DATA_DIR, OCR_DIR  # type: ignore[import]
 
 app = Flask(__name__)
 
+# ---------- Auth / config ----------
+
+app.secret_key = os.getenv("STRAIGHTLINE_SECRET_KEY", "dev-not-secret")
+ADMIN_USER = os.getenv("STRAIGHTLINE_ADMIN_USER", "admin")
+ADMIN_PASSWORD = os.getenv("STRAIGHTLINE_ADMIN_PASSWORD", "change-me")
+
+
+def login_required(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        if not session.get("logged_in"):
+            return redirect(url_for("login", next=request.path))
+        return view(*args, **kwargs)
+
+    return wrapped
+
+
+# ---------- Debug helper ----------
+
+
+def _log_debug(msg: str) -> None:
+    """
+    Simple stderr logger so messages show up in journalctl.
+    """
+    print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
+
+
 # ---------- Web search helpers ----------
 
 DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/html/"
@@ -38,81 +75,118 @@ DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/html/"
 
 def _extract_real_url(href: str) -> str:
     """
-    DuckDuckGo often wraps outbound links as /l/?uddg=<encoded_url>.
-    This helper unwraps those when present.
+    DuckDuckGo often wraps outbound links as /l/?uddg=<encoded_url>
+    OR https://duckduckgo.com/l/?uddg=<encoded_url>.
+
+    This helper unwraps both styles when present.
     """
-    if href.startswith("/"):
-        parsed = urlparse(href)
+    parsed = urlparse(href)
+
+    # Case 1: relative wrapper like /l/?uddg=...
+    if not parsed.scheme and href.startswith("/"):
         qs = parse_qs(parsed.query)
         if "uddg" in qs and qs["uddg"]:
             return unquote(qs["uddg"][0])
+        return href
+
+    # Case 2: absolute wrapper like https://duckduckgo.com/l/?uddg=...
+    if parsed.netloc and "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l"):
+        qs = parse_qs(parsed.query)
+        if "uddg" in qs and qs["uddg"]:
+            return unquote(qs["uddg"][0])
+
+    # Otherwise just return original href
     return href
 
 
 def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
     """
-    Use DuckDuckGo's HTML endpoint to find outbound URLs.
+    Use DuckDuckGo's HTML endpoint to find document-like URLs.
 
-    Strategy:
-      1. Look specifically for main result links (a.result__a, a[data-testid]).
-      2. If that yields nothing, fall back to any external http(s) links.
+    First try POST to html.duckduckgo.com/html (the "lite" interface),
+    then fall back to GET on duckduckgo.com/html if needed.
     """
+    _log_debug(f"fetch_doc_urls: query={query!r}, limit={limit}")
+
     params = {"q": query, "kl": "us-en"}
     headers = {
-        "User-Agent": "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)",
+        "User-Agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) "
+            "Chrome/120.0 Safari/537.36 StraightlineVault/0.1"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
     }
 
-    resp = requests.get(DUCKDUCKGO_SEARCH_URL, params=params, headers=headers, timeout=20)
-    resp.raise_for_status()
+    def _parse_response(resp: requests.Response, label: str) -> list[str]:
+        _log_debug(f"{label}: status={resp.status_code}, final_url={resp.url}")
+        resp.raise_for_status()
 
-    soup = BeautifulSoup(resp.text, "html.parser")
-    urls: list[str] = []
+        snippet = resp.text[:400].replace("\n", "\\n")
+        _log_debug(f"{label}: body_snippet={snippet}")
 
-    # --- Primary: DDG web results ---
-    for a in soup.select("a.result__a, a[data-testid='result-title-a']"):
-        raw_href = a.get("href")
-        if not raw_href:
-            continue
+        soup = BeautifulSoup(resp.text, "html.parser")
+        anchors = soup.find_all("a", href=True)
+        _log_debug(f"{label}: total_anchors={len(anchors)}")
 
-        href = _extract_real_url(raw_href)
-        if not href.startswith("http"):
-            continue
+        urls: list[str] = []
+        debug_shown = 0
 
-        parsed = urlparse(href)
-        netloc = (parsed.netloc or "").lower()
-
-        # Skip internal DuckDuckGo links AFTER trying to unwrap uddg
-        if "duckduckgo.com" in netloc:
-            continue
-
-        if href not in urls:
-            urls.append(href)
-
-        if len(urls) >= limit:
-            return urls
-
-    # --- Fallback: any external http(s) link on the page ---
-    if not urls:
-        for a in soup.find_all("a", href=True):
+        for a in anchors:
             raw_href = a["href"]
             href = _extract_real_url(raw_href)
 
+            # Skip non-http links
             if not href.startswith("http"):
                 continue
 
-            parsed = urlparse(href)
-            netloc = (parsed.netloc or "").lower()
+            netloc = urlparse(href).netloc.lower()
 
+            # Skip DDG internal links after unwrap
             if "duckduckgo.com" in netloc:
                 continue
 
             if href not in urls:
                 urls.append(href)
+                if debug_shown < 10:
+                    _log_debug(f"{label}: candidate_url={href}")
+                    debug_shown += 1
 
             if len(urls) >= limit:
                 break
 
-    return urls
+        _log_debug(f"{label}: returning {len(urls)} url(s)")
+        return urls
+
+    urls: list[str] = []
+
+    # --- Try POST to the html.duckduckgo.com "lite" endpoint first
+    try:
+        resp_post = requests.post(
+            "https://html.duckduckgo.com/html/",
+            data=params,
+            headers=headers,
+            timeout=20,
+        )
+        urls = _parse_response(resp_post, "ddg_post")
+    except Exception as e:
+        _log_debug(f"ddg_post_error={e!r}")
+
+    # --- Fallback: GET on duckduckgo.com/html if POST didn't yield anything
+    if not urls:
+        try:
+            resp_get = requests.get(
+                DUCKDUCKGO_SEARCH_URL,
+                params=params,
+                headers=headers,
+                timeout=20,
+            )
+            urls = _parse_response(resp_get, "ddg_get")
+        except Exception as e:
+            _log_debug(f"ddg_get_error={e!r}")
+
+    _log_debug(f"fetch_doc_urls: final_urls={len(urls)}")
+    return urls[:limit]
 
 
 # ---------- Ingest helpers for ANY URL ----------
@@ -150,7 +224,7 @@ def _write_txt_and_manifest(
     except ValueError:
         txt_rel = txt_path
 
-    entry = {
+    entry: dict[str, object | None] = {
         "kind": kind,
         "pdf": None,
         "txt": str(txt_rel),
@@ -203,7 +277,6 @@ def ingest_url_web(url: str, case: str | None):
       - If it's HTML -> strip to text and record as web_html.
       - If it's text/* -> record as web_text.
       - Otherwise -> raise ValueError so the UI can show an error.
-
     Returns (pdf_path, txt_path) where pdf_path may be None.
     """
     headers = {
@@ -252,7 +325,7 @@ def ingest_url_web(url: str, case: str | None):
 
     # ---- HTML
     if "html" in ctype or url.lower().endswith((".htm", ".html", "/")):
-        soup = BeautifulSoup(resp.text, "html.parser")
+        soup = BeautifulSoup(resp.text, "html_parser" if False else "html.parser")
         text = soup.get_text("\n", strip=True)
         txt_path = _write_txt_and_manifest(text, url, case, kind="web_html")
         return None, txt_path
@@ -296,6 +369,40 @@ BASE_STYLE = """
 
 # ---------- Templates ----------
 
+LOGIN_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8"><title>Straightline Vault — Login</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+</nav>
+
+<h1>Admin Login</h1>
+<p class="meta">You must log in to access admin and ingest functions.</p>
+
+<form method="post" action="/login">
+  <div>
+    <label for="username">User</label>
+    <input type="text" id="username" name="username" autofocus>
+  </div>
+  <div>
+    <label for="password">Pass</label>
+    <input type="password" id="password" name="password">
+  </div>
+  <div style="margin-top: 0.5rem;">
+    <button type="submit">Log in</button>
+  </div>
+  {% if error %}
+    <div class="error">{{ error }}</div>
+  {% endif %}
+</form>
+
+</body></html>
+"""
+
 INDEX_TEMPLATE = """
 <!doctype html>
 <html><head>
@@ -307,6 +414,12 @@ INDEX_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
+  {% if session.logged_in %}
+    <a href="/admin">Admin</a>
+    <a href="/logout">Logout</a>
+  {% else %}
+    <a href="/login">Login</a>
+  {% endif %}
 </nav>
 
 <h1>Straightline Vault</h1>
@@ -371,6 +484,8 @@ CASES_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
+  <a href="/admin">Admin</a>
+  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Cases</h1>
@@ -412,6 +527,8 @@ CASE_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
+  <a href="/admin">Admin</a>
+  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Case: {{ case_name }}</h1>
@@ -458,6 +575,8 @@ DOC_TEMPLATE = """
     <a href="/case/{{ case_name }}">Back to case</a>
   {% endif %}
   <a href="/web-ingest">Web Ingest</a>
+  <a href="/admin">Admin</a>
+  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Document: {{ doc_id }}</h1>
@@ -489,6 +608,8 @@ WEB_INGEST_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
+  <a href="/admin">Admin</a>
+  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Web Ingest</h1>
@@ -621,7 +742,45 @@ def index():
     )
 
 
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+        if username == ADMIN_USER and password == ADMIN_PASSWORD:
+            session["logged_in"] = True
+            next_url = request.args.get("next") or url_for("admin_home")
+            return redirect(next_url)
+        else:
+            error = "Invalid username or password."
+
+    return render_template_string(
+        LOGIN_TEMPLATE,
+        style=BASE_STYLE,
+        error=error,
+    )
+
+
+@app.route("/logout", methods=["GET"])
+def logout():
+    session.clear()
+    return redirect(url_for("index"))
+
+
+@app.route("/admin", methods=["GET"])
+@login_required
+def admin_home():
+    stats = build_case_stats()
+    return render_template_string(
+        CASES_TEMPLATE,
+        style=BASE_STYLE,
+        cases=stats,
+    )
+
+
 @app.route("/cases", methods=["GET"])
+@login_required
 def cases_view():
     return render_template_string(
         CASES_TEMPLATE,
@@ -631,6 +790,7 @@ def cases_view():
 
 
 @app.route("/case/<case_name>", methods=["GET"])
+@login_required
 def case_view(case_name: str):
     docs = []
     for rec in iter_manifest() or []:
@@ -663,6 +823,7 @@ def case_view(case_name: str):
 
 
 @app.route("/doc/<doc_id>", methods=["GET"])
+@login_required
 def doc_view(doc_id: str):
     rec = find_manifest_by_doc_id(doc_id)
     if not rec:
@@ -685,6 +846,7 @@ def doc_view(doc_id: str):
 
 
 @app.route("/web-ingest", methods=["GET", "POST"])
+@login_required
 def web_ingest():
     query = ""
     case = ""

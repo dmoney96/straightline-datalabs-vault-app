@@ -5,3 +5,6 @@ pillow
 fastapi
 uvicorn[standard]
 python-multipart
+requests
+beautifulsoup4
+python-docx
