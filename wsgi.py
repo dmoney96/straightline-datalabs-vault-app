@@ -310,41 +310,12 @@ def ingest_url_web(url: str, case: str | None):
     raise ValueError(f"Unsupported content type for web ingest: {ctype or 'unknown'}")
 
 
-# ---------- Base Styles (responsive + dark mode) ----------
+# ---------- Base Styles ----------
 
 BASE_STYLE = """
 <style>
   :root {
-    color-scheme: dark light;
-    --bg: #0b0c10;
-    --bg-elevated: #11141c;
-    --border-subtle: #252839;
-    --text-main: #e4e7f5;
-    --text-muted: #9ca3c7;
-    --accent: #60a5fa;
-    --accent-soft: rgba(96, 165, 250, 0.15);
-    --danger: #f97373;
-    --code-bg: #111827;
-    --chip-bg: #1f2937;
-    --radius-lg: 12px;
-    --radius-pill: 999px;
-    --shadow-soft: 0 18px 40px rgba(15, 23, 42, 0.45);
-  }
-
-  @media (prefers-color-scheme: light) {
-    :root {
-      --bg: #f3f4f8;
-      --bg-elevated: #ffffff;
-      --border-subtle: #d1d5e5;
-      --text-main: #111827;
-      --text-muted: #6b7280;
-      --accent: #2563eb;
-      --accent-soft: rgba(37, 99, 235, 0.08);
-      --danger: #b91c1c;
-      --code-bg: #f3f4f6;
-      --chip-bg: #eef2ff;
-      --shadow-soft: 0 18px 40px rgba(148, 163, 184, 0.45);
-    }
+    color-scheme: light dark;
   }
 
   * {
@@ -352,321 +323,307 @@ BASE_STYLE = """
   }
 
   body {
-    margin: 0;
-    min-height: 100vh;
     font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    background: radial-gradient(circle at top left, #111827 0, #020617 45%, #000 100%);
-    color: var(--text-main);
-    display: flex;
-    justify-content: center;
-    padding: 2.5rem 1rem;
+    margin: 1.5rem auto;
+    padding: 0 1.25rem 2rem;
+    max-width: 980px;
+    line-height: 1.5;
+    background: #020617;
+    color: #e5e7eb;
   }
 
-  .page-shell {
-    width: 100%;
-    max-width: 1100px;
-    background: linear-gradient(145deg, rgba(15,23,42,0.98), rgba(17,24,39,0.98));
-    border-radius: 18px;
-    border: 1px solid rgba(148,163,184,0.2);
-    box-shadow: var(--shadow-soft);
-    padding: 1.75rem 1.5rem 2rem;
-  }
-
-  @media (min-width: 900px) {
-    .page-shell {
-      padding: 2rem 2.25rem 2.25rem;
+  @media (prefers-color-scheme: light) {
+    body {
+      background: #f9fafb;
+      color: #111827;
     }
   }
 
-  header {
-    display: flex;
-    flex-wrap: wrap;
-    align-items: baseline;
-    justify-content: space-between;
-    row-gap: 0.25rem;
-    margin-bottom: 1.25rem;
-  }
-
   h1 {
-    font-size: 1.5rem;
-    letter-spacing: 0.04em;
-    text-transform: uppercase;
-    margin: 0;
-    display: flex;
-    align-items: center;
-    gap: 0.4rem;
-  }
-
-  h1 span.badge {
-    font-size: 0.7rem;
-    text-transform: uppercase;
-    letter-spacing: 0.12em;
-    padding: 0.18rem 0.6rem;
-    border-radius: var(--radius-pill);
-    background: var(--accent-soft);
-    color: var(--accent);
-    border: 1px solid rgba(96,165,250,0.4);
+    margin: 0.5rem 0 0.25rem;
+    font-size: 1.6rem;
+    letter-spacing: 0.02em;
   }
 
   h2 {
-    margin-top: 1.5rem;
-    margin-bottom: 0.5rem;
-    font-size: 1rem;
-    text-transform: uppercase;
-    letter-spacing: 0.09em;
-    color: var(--text-muted);
+    margin-top: 1.75rem;
+    font-size: 1.2rem;
   }
 
   a {
-    color: inherit;
     text-decoration: none;
+    color: #38bdf8;
   }
+
   a:hover {
     text-decoration: underline;
   }
 
   nav {
     display: flex;
-    gap: 0.4rem;
-    flex-wrap: wrap;
+    gap: 0.75rem;
+    align-items: center;
+    margin-bottom: 0.75rem;
+    padding: 0.5rem 0;
+    border-bottom: 1px solid rgba(148, 163, 184, 0.4);
+    position: sticky;
+    top: 0;
+    backdrop-filter: blur(10px);
+    background: linear-gradient(
+      to bottom,
+      rgba(15, 23, 42, 0.95),
+      rgba(15, 23, 42, 0.85),
+      transparent
+    );
+    z-index: 10;
+  }
+
+  @media (prefers-color-scheme: light) {
+    nav {
+      border-bottom-color: rgba(203, 213, 225, 0.7);
+      background: linear-gradient(
+        to bottom,
+        rgba(248, 250, 252, 0.96),
+        rgba(248, 250, 252, 0.9),
+        transparent
+      );
+    }
   }
 
   nav a {
-    font-size: 0.8rem;
-    padding: 0.3rem 0.8rem;
-    border-radius: var(--radius-pill);
-    border: 1px solid rgba(148,163,184,0.35);
-    background: rgba(15,23,42,0.7);
-    color: var(--text-muted);
-    text-decoration: none;
+    font-size: 0.95rem;
+    padding: 0.25rem 0.5rem;
+    border-radius: 999px;
   }
 
   nav a:hover {
-    border-color: var(--accent);
-    color: var(--accent);
-    background: rgba(15,23,42,0.95);
+    background: rgba(148, 163, 184, 0.18);
   }
 
-  .subtitle {
-    font-size: 0.82rem;
-    color: var(--text-muted);
-    margin-top: 0.3rem;
+  form {
+    margin: 1rem 0 1.5rem;
+    padding: 0.85rem 1rem 1rem;
+    border-radius: 0.85rem;
+    border: 1px solid rgba(148, 163, 184, 0.45);
+    background: radial-gradient(circle at top left, rgba(56, 189, 248, 0.12), transparent 55%),
+                radial-gradient(circle at bottom right, rgba(129, 140, 248, 0.16), transparent 60%),
+                rgba(15, 23, 42, 0.9);
   }
 
-  form.search-form,
-  form.web-form {
-    margin: 1.3rem 0 1.4rem;
+  @media (prefers-color-scheme: light) {
+    form {
+      background: radial-gradient(circle at top left, rgba(59, 130, 246, 0.06), transparent 55%),
+                  radial-gradient(circle at bottom right, rgba(14, 116, 144, 0.08), transparent 60%),
+                  #ffffff;
+      border-color: rgba(148, 163, 184, 0.5);
+    }
+  }
+
+  .form-row {
     display: flex;
-    flex-direction: column;
-    gap: 0.6rem;
-  }
-
-  .field-row {
-    display: flex;
-    gap: 0.6rem;
-    align-items: center;
     flex-wrap: wrap;
+    gap: 0.6rem 0.75rem;
+    align-items: center;
+    margin-bottom: 0.4rem;
   }
 
   label {
-    font-size: 0.8rem;
-    color: var(--text-muted);
-    min-width: 3.5rem;
+    min-width: 4.5rem;
+    font-size: 0.9rem;
+    color: #cbd5f5;
+  }
+
+  @media (prefers-color-scheme: light) {
+    label {
+      color: #4b5563;
+    }
   }
 
   input[type="text"],
   input[type="number"] {
-    flex: 1 1 180px;
-    min-width: 0;
-    padding: 0.5rem 0.65rem;
-    border-radius: 999px;
-    border: 1px solid var(--border-subtle);
-    background: rgba(15,23,42,0.9);
-    color: var(--text-main);
-    font-size: 0.88rem;
+    flex: 1 1 10rem;
+    max-width: 26rem;
+    padding: 0.4rem 0.5rem;
+    border-radius: 0.5rem;
+    border: 1px solid rgba(148, 163, 184, 0.7);
+    background: rgba(15, 23, 42, 0.8);
+    color: inherit;
+    font-size: 0.95rem;
   }
 
-  input[type="text"]::placeholder {
-    color: rgba(148,163,184,0.8);
+  @media (prefers-color-scheme: light) {
+    input[type="text"],
+    input[type="number"] {
+      background: #f9fafb;
+    }
   }
 
   input[type="text"]:focus,
   input[type="number"]:focus {
-    outline: none;
-    border-color: var(--accent);
-    box-shadow: 0 0 0 1px rgba(96,165,250,0.45);
+    outline: 2px solid #38bdf8;
+    outline-offset: 1px;
+    border-color: #38bdf8;
   }
 
   button[type="submit"] {
-    border: none;
+    margin-left: 0.5rem;
+    padding: 0.45rem 0.9rem;
     border-radius: 999px;
-    padding: 0.5rem 0.9rem;
-    font-size: 0.85rem;
-    background: radial-gradient(circle at 0 0, #60a5fa, #2563eb);
-    color: #f9fafb;
+    border: none;
+    font-size: 0.9rem;
     cursor: pointer;
-    display: inline-flex;
-    align-items: center;
-    gap: 0.3rem;
-    white-space: nowrap;
+    background: linear-gradient(135deg, #38bdf8, #6366f1);
+    color: #0b1120;
+    font-weight: 600;
+    box-shadow: 0 10px 25px rgba(37, 99, 235, 0.35);
   }
 
   button[type="submit"]:hover {
     filter: brightness(1.05);
-  }
-
-  button[type="submit"]::after {
-    content: "↵";
-    font-size: 0.9rem;
-    opacity: 0.9;
+    box-shadow: 0 12px 28px rgba(37, 99, 235, 0.45);
   }
 
   .meta {
-    color: var(--text-muted);
-    font-size: 0.8rem;
-  }
-
-  .results-list {
-    margin-top: 0.4rem;
+    color: #9ca3af;
+    font-size: 0.9rem;
   }
 
   .result {
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border-subtle);
-    padding: 0.7rem 0.75rem;
-    margin-top: 0.6rem;
-    background: radial-gradient(circle at top left, #020617 0, #020617 45%, #020617 100%);
+    border-radius: 0.75rem;
+    padding: 0.75rem 0.9rem;
+    margin: 0.4rem 0;
+    border: 1px solid rgba(31, 41, 55, 0.9);
+    background: radial-gradient(circle at top left, rgba(148, 163, 184, 0.16), transparent 55%),
+                rgba(15, 23, 42, 0.95);
   }
 
-  .result-header {
-    display: flex;
-    justify-content: space-between;
-    align-items: baseline;
-    gap: 0.4rem;
+  @media (prefers-color-scheme: light) {
+    .result {
+      background: #ffffff;
+      border-color: rgba(148, 163, 184, 0.55);
+    }
   }
 
-  .result-title a {
-    font-weight: 600;
-    letter-spacing: 0.02em;
-  }
-
-  .score {
-    font-size: 0.75rem;
-    color: var(--text-muted);
-  }
-
-  .chip-row {
-    margin-top: 0.35rem;
-    display: flex;
-    flex-wrap: wrap;
-    gap: 0.3rem;
-  }
-
-  .chip {
-    font-size: 0.7rem;
-    padding: 0.12rem 0.55rem;
-    border-radius: var(--radius-pill);
-    background: var(--chip-bg);
-    color: var(--text-muted);
-  }
-
-  .chip strong {
-    font-weight: 500;
-    color: var(--text-main);
+  .result strong a {
+    font-size: 0.98rem;
   }
 
   .snippet {
-    margin-top: 0.4rem;
-    font-size: 0.85rem;
-    color: #e5e7eb;
+    margin-top: 0.35rem;
+    font-size: 0.95rem;
+  }
+
+  .score {
+    font-size: 0.82rem;
+    color: #9ca3af;
+    margin-left: 0.35rem;
   }
 
   code {
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-      "Liberation Mono", "Courier New", monospace;
-    font-size: 0.78rem;
-    background: var(--code-bg);
-    padding: 0.1rem 0.4rem;
-    border-radius: 999px;
+                 "Liberation Mono", "Courier New", monospace;
+    font-size: 0.85rem;
   }
 
   table {
     border-collapse: collapse;
     width: 100%;
-    font-size: 0.85rem;
     margin-top: 0.75rem;
+    border-radius: 0.75rem;
+    overflow: hidden;
+    border: 1px solid rgba(55, 65, 81, 0.85);
   }
 
   th, td {
-    border-bottom: 1px solid rgba(148,163,184,0.35);
-    padding: 0.4rem 0.25rem;
+    border-bottom: 1px solid rgba(55, 65, 81, 0.85);
+    padding: 0.45rem 0.45rem;
     text-align: left;
+    font-size: 0.9rem;
   }
 
   th {
     font-weight: 600;
-    color: var(--text-muted);
+    background: rgba(15, 23, 42, 0.95);
+  }
+
+  @media (prefers-color-scheme: light) {
+    th, td {
+      border-bottom-color: rgba(209, 213, 219, 0.9);
+    }
+    th {
+      background: #f3f4f6;
+    }
   }
 
   pre {
     white-space: pre-wrap;
     font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-      "Liberation Mono", "Courier New", monospace;
-    font-size: 0.85rem;
-    background: var(--code-bg);
+                 "Liberation Mono", "Courier New", monospace;
+    font-size: 0.9rem;
     padding: 0.75rem 0.9rem;
-    border-radius: 12px;
-    border: 1px solid rgba(148,163,184,0.35);
-    margin-top: 0.7rem;
-    max-height: 80vh;
-    overflow-y: auto;
+    border-radius: 0.75rem;
+    border: 1px solid rgba(55, 65, 81, 0.9);
+    background: rgba(15, 23, 42, 0.95);
+    max-height: 70vh;
+    overflow: auto;
+  }
+
+  @media (prefers-color-scheme: light) {
+    pre {
+      background: #ffffff;
+      border-color: rgba(209, 213, 219, 0.95);
+    }
   }
 
   .error {
-    color: var(--danger);
+    color: #fecaca;
+    background: rgba(127, 29, 29, 0.32);
+    border-radius: 0.6rem;
+    padding: 0.4rem 0.6rem;
     margin-top: 0.5rem;
-    font-size: 0.85rem;
+    font-size: 0.9rem;
+  }
+
+  @media (prefers-color-scheme: light) {
+    .error {
+      color: #7f1d1d;
+      background: #fee2e2;
+    }
   }
 
   .ingested-item {
-    border-radius: var(--radius-lg);
-    border: 1px solid var(--border-subtle);
-    padding: 0.6rem 0.7rem;
-    margin-top: 0.6rem;
-    background: rgba(15,23,42,0.9);
+    border-radius: 0.75rem;
+    padding: 0.55rem 0.65rem;
+    margin: 0.4rem 0;
+    border: 1px dashed rgba(55, 65, 81, 0.85);
+    background: rgba(15, 23, 42, 0.9);
   }
 
-  .ingested-item strong {
-    font-weight: 600;
-  }
-
-  .section-card {
-    margin-top: 0.75rem;
-    padding: 0.7rem 0.8rem;
-    border-radius: var(--radius-lg);
-    border: 1px dashed rgba(148,163,184,0.45);
-    background: rgba(15,23,42,0.6);
+  @media (prefers-color-scheme: light) {
+    .ingested-item {
+      background: #f9fafb;
+      border-color: rgba(148, 163, 184, 0.8);
+    }
   }
 
   @media (max-width: 640px) {
-    .page-shell {
-      padding: 1.25rem 1rem 1.5rem;
-      border-radius: 0;
-      border-left: none;
-      border-right: none;
+    body {
+      margin-top: 1rem;
+      padding-inline: 0.75rem;
     }
-
-    header {
-      flex-direction: column;
-      align-items: flex-start;
-      gap: 0.4rem;
+    nav {
+      flex-wrap: wrap;
+      gap: 0.4rem 0.6rem;
+    }
+    form {
+      padding-inline: 0.75rem;
     }
   }
 </style>
 """
 
 
-# ---------- Templates ----------
+# ---------- Templates (no internal admin login) ----------
 
 INDEX_TEMPLATE = """
 <!doctype html>
@@ -675,78 +632,61 @@ INDEX_TEMPLATE = """
 {{ style|safe }}
 </head>
 <body>
-  <main class="page-shell">
-    <header>
-      <div>
-        <h1>Straightline Vault <span class="badge">Search</span></h1>
-        <p class="subtitle">Full-text search across your ingested corpus. Protected by nginx basic auth.</p>
-      </div>
-      <nav>
-        <a href="/">Search</a>
-        <a href="/cases">Cases</a>
-        <a href="/web-ingest">Web Ingest</a>
-      </nav>
-    </header>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
 
-    <form method="get" action="/" class="search-form">
-      <div class="field-row">
-        <label for="q">Query</label>
-        <input type="text" id="q" name="q" value="{{ q|e }}" autofocus placeholder="epstein subpoena maxwell 1320...">
-      </div>
-      <div class="field-row">
-        <label for="case">Case</label>
-        <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="optional (e.g. maxwell_1320)">
-      </div>
-      <div class="field-row">
-        <label for="kind">Kind</label>
-        <input type="text" id="kind" name="kind" value="{{ kind|e }}" placeholder="local_file, url_fetch, web_html">
-      </div>
-      <div class="field-row">
-        <label for="limit">Limit</label>
-        <input type="number" id="limit" name="limit" value="{{ limit }}">
-        <button type="submit">Search</button>
-      </div>
-    </form>
+<h1>Straightline Vault</h1>
+<p class="meta">Full-text search across your ingested corpus. Protected by nginx basic auth.</p>
 
-    {% if q %}
-      <section class="section-card">
+<form method="get" action="/">
+  <div class="form-row">
+    <label for="q">Query</label>
+    <input type="text" id="q" name="q" value="{{ q|e }}" autofocus>
+  </div>
+  <div class="form-row">
+    <label for="case">Case</label>
+    <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="optional">
+  </div>
+  <div class="form-row">
+    <label for="kind">Kind</label>
+    <input type="text" id="kind" name="kind" value="{{ kind|e }}" placeholder="local_file, url_fetch, web_html">
+  </div>
+  <div class="form-row" style="margin-top: 0.25rem;">
+    <label for="limit">Limit</label>
+    <input type="number" id="limit" name="limit" value="{{ limit }}">
+    <button type="submit">Search</button>
+  </div>
+</form>
+
+{% if q %}
+  <h2>Results for <code>{{ q }}</code></h2>
+  {% if results %}
+    <p class="meta">{{ results|length }} result(s) shown.</p>
+    {% for r in results %}
+      <div class="result">
+        <div>
+          <strong><a href="/doc/{{ r.doc_id }}">{{ r.doc_id }}</a></strong>
+          <span class="score">(score={{ "%.2f"|format(r.score) }})</span>
+        </div>
         <div class="meta">
-          <strong>Query:</strong> <code>{{ q }}</code>
-          {% if case %} · <strong>Case:</strong> <code>{{ case }}</code>{% endif %}
-          {% if kind %} · <strong>Kind:</strong> <code>{{ kind }}</code>{% endif %}
+          Source:
+          <code title="{{ r.source_full or r.source }}">{{ r.source }}</code>
+          {% if r.case or r.kind %}
+            —
+            {% if r.case %}case={{ r.case }}{% endif %}
+            {% if r.kind %} kind={{ r.kind }}{% endif %}
+          {% endif %}
         </div>
-      </section>
-
-      <h2>Results</h2>
-      {% if results %}
-        <p class="meta">{{ results|length }} result(s) shown.</p>
-        <div class="results-list">
-          {% for r in results %}
-            <article class="result">
-              <div class="result-header">
-                <div class="result-title">
-                  <strong><a href="/doc/{{ r.doc_id }}">{{ r.doc_id }}</a></strong>
-                </div>
-                <span class="score">score={{ "%.2f"|format(r.score) }}</span>
-              </div>
-              <div class="chip-row">
-                <span class="chip"><strong>source</strong> <code>{{ r.source }}</code></span>
-                {% if r.case %}
-                  <span class="chip"><strong>case</strong> {{ r.case }}</span>
-                {% endif %}
-                {% if r.kind %}
-                  <span class="chip"><strong>kind</strong> {{ r.kind }}</span>
-                {% endif %}
-              </div>
-              <p class="snippet">{{ r.snippet|safe }}</p>
-            </article>
-          {% endfor %}
-        </div>
-      {% else %}
-        <p class="meta">No results found.</p>
-      {% endif %}
-    {% endif %}
-  </main>
+        <div class="snippet">{{ r.snippet|safe }}</div>
+      </div>
+    {% endfor %}
+  {% else %}
+    <p>No results found.</p>
+  {% endif %}
+{% endif %}
 </body></html>
 """
 
@@ -757,43 +697,37 @@ CASES_TEMPLATE = """
 {{ style|safe }}
 </head>
 <body>
-  <main class="page-shell">
-    <header>
-      <div>
-        <h1>Straightline Vault <span class="badge">Cases</span></h1>
-        <p class="subtitle">Overview of all cases represented in the manifest.</p>
-      </div>
-      <nav>
-        <a href="/">Search</a>
-        <a href="/cases">Cases</a>
-        <a href="/web-ingest">Web Ingest</a>
-      </nav>
-    </header>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
 
-    {% if not cases %}
-      <p class="meta">No cases found.</p>
-    {% else %}
-      <h2>Case Index</h2>
-      <table>
-        <thead>
-          <tr><th>Case</th><th>Total docs</th><th>Kind breakdown</th></tr>
-        </thead>
-        <tbody>
-          {% for case_name, info in cases %}
-            <tr>
-              <td><a href="/case/{{ case_name }}">{{ case_name }}</a></td>
-              <td>{{ info.total }}</td>
-              <td>
-                {% for kind, count in info.kinds.items() %}
-                  {{ kind }}={{ count }}{% if not loop.last %}, {% endif %}
-                {% endfor %}
-              </td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% endif %}
-  </main>
+<h1>Cases</h1>
+<p class="meta">Overview of all cases in the manifest.</p>
+
+{% if not cases %}
+  <p>No cases found.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr><th>Case</th><th>Total docs</th><th>Kind breakdown</th></tr>
+    </thead>
+    <tbody>
+      {% for case_name, info in cases %}
+        <tr>
+          <td><a href="/case/{{ case_name }}">{{ case_name }}</a></td>
+          <td>{{ info.total }}</td>
+          <td>
+            {% for kind, count in info.kinds.items() %}
+              {{ kind }}={{ count }}{% if not loop.last %}, {% endif %}
+            {% endfor %}
+          </td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
 </body></html>
 """
 
@@ -804,45 +738,42 @@ CASE_TEMPLATE = """
 {{ style|safe }}
 </head>
 <body>
-  <main class="page-shell">
-    <header>
-      <div>
-        <h1>Straightline Vault <span class="badge">Case</span></h1>
-        <p class="subtitle">Documents for case <code>{{ case_name }}</code>.</p>
-      </div>
-      <nav>
-        <a href="/">Search</a>
-        <a href="/cases">Cases</a>
-        <a href="/web-ingest">Web Ingest</a>
-      </nav>
-    </header>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
 
-    <p class="meta">
-      {{ docs|length }} document(s) in this case —
-      <a href="/?case={{ case_name|e }}">Search within this case</a>
-    </p>
+<h1>Case: {{ case_name }}</h1>
+<p class="meta">
+  {{ docs|length }} document(s) in this case.
+  —
+  <a href="/?case={{ case_name|e }}">Search within this case</a>
+</p>
 
-    {% if not docs %}
-      <p class="meta">No documents found for this case.</p>
-    {% else %}
-      <h2>Documents</h2>
-      <table>
-        <thead>
-          <tr><th>Doc ID</th><th>Kind</th><th>PDF</th><th>Source URL</th></tr>
-        </thead>
-        <tbody>
-          {% for d in docs %}
-            <tr>
-              <td><a href="/doc/{{ d.doc_id }}">{{ d.doc_id }}</a></td>
-              <td>{{ d.kind or "" }}</td>
-              <td><code>{{ d.pdf or "" }}</code></td>
-              <td>{% if d.source_url %}<code>{{ d.source_url }}</code>{% endif %}</td>
-            </tr>
-          {% endfor %}
-        </tbody>
-      </table>
-    {% endif %}
-  </main>
+{% if not docs %}
+  <p>No documents found for this case.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr><th>Doc ID</th><th>Kind</th><th>PDF</th><th>Source URL</th></tr>
+    </thead>
+    <tbody>
+      {% for d in docs %}
+        <tr>
+          <td><a href="/doc/{{ d.doc_id }}">{{ d.doc_id }}</a></td>
+          <td>{{ d.kind or "" }}</td>
+          <td>
+            {% if d.pdf %}
+              <code title="{{ d.pdf_full or d.pdf }}">{{ d.pdf }}</code>
+            {% endif %}
+          </td>
+          <td>{% if d.source_url %}<code>{{ d.source_url }}</code>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
 </body></html>
 """
 
@@ -854,39 +785,32 @@ DOC_TEMPLATE = """
 {{ style|safe }}
 </head>
 <body>
-  <main class="page-shell">
-    <header>
-      <div>
-        <h1>Straightline Vault <span class="badge">Document</span></h1>
-        <p class="subtitle">Inspect OCR text for a single ingested document.</p>
-      </div>
-      <nav>
-        <a href="/">Search</a>
-        <a href="/cases">Cases</a>
-        {% if case_name %}
-          <a href="/case/{{ case_name }}">Back to case</a>
-        {% endif %}
-        <a href="/web-ingest">Web Ingest</a>
-      </nav>
-    </header>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  {% if case_name %}
+    <a href="/case/{{ case_name }}">Back to case</a>
+  {% endif %}
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
 
-    <section class="section-card">
-      <p class="meta">
-        <strong>ID:</strong> <code>{{ doc_id }}</code>
-        {% if case_name %} · <strong>case</strong>=<code>{{ case_name }}</code>{% endif %}
-        {% if kind %} · <strong>kind</strong>=<code>{{ kind }}</code>{% endif %}
-        {% if pdf %} · <strong>PDF:</strong> <code>{{ pdf }}</code>{% endif %}
-        {% if source_url %} · <strong>Source URL:</strong> <code>{{ source_url }}</code>{% endif %}
-      </p>
-    </section>
+<h1>Document: {{ doc_id }}</h1>
+<p class="meta">
+  {% if case_name %}case={{ case_name }} — {% endif %}
+  {% if kind %}kind={{ kind }} — {% endif %}
+  {% if pdf %}
+    PDF: <code title="{{ pdf_full or pdf }}">{{ pdf }}</code>
+    —
+  {% endif %}
+  {% if source_url %}Source URL: <code>{{ source_url }}</code>{% endif %}
+</p>
 
-    <h2>OCR Text</h2>
-    {% if error %}
-      <p class="meta">Error reading OCR text: {{ error }}</p>
-    {% else %}
-      <pre>{{ content }}</pre>
-    {% endif %}
-  </main>
+<h2>OCR Text</h2>
+{% if error %}
+  <p class="meta">Error reading OCR text: {{ error }}</p>
+{% else %}
+  <pre>{{ content }}</pre>
+{% endif %}
 </body></html>
 """
 
@@ -898,79 +822,86 @@ WEB_INGEST_TEMPLATE = """
 {{ style|safe }}
 </head>
 <body>
-  <main class="page-shell">
-    <header>
-      <div>
-        <h1>Straightline Vault <span class="badge">Web Ingest</span></h1>
-        <p class="subtitle">
-          Search the public web for documents (PDF, HTML, text, DOCX, CSV) and ingest them into a case.
-          PDFs go through the existing pipeline; other types are converted to text and stored.
-        </p>
-      </div>
-      <nav>
-        <a href="/">Search</a>
-        <a href="/cases">Cases</a>
-        <a href="/web-ingest">Web Ingest</a>
-      </nav>
-    </header>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
 
-    <form method="post" action="/web-ingest" class="web-form">
-      <div class="field-row">
-        <label for="q">Query</label>
-        <input type="text" id="q" name="q" value="{{ query|e }}"
-               placeholder="e.g. Jamal Khashoggi CIA report site:gov pdf">
-      </div>
+<h1>Web Ingest</h1>
+<p class="meta">
+  Search the public web for documents (PDF, HTML, text, DOCX, CSV) and ingest them into a case.
+  PDFs go through the existing pipeline; other types are converted to text and stored.
+</p>
 
-      <div class="field-row">
-        <label for="case">Case</label>
-        <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="auto if blank">
-      </div>
+<form method="post" action="/web-ingest">
+  <div class="form-row">
+    <label for="q">Query</label>
+    <input type="text" id="q" name="q" value="{{ query|e }}" placeholder="e.g. Jamal Khashoggi CIA report">
+  </div>
 
-      <div class="field-row">
-        <label for="limit">Limit</label>
-        <input type="number" id="limit" name="limit" value="{{ limit }}">
-        <button type="submit">Search &amp; Ingest</button>
-      </div>
+  <div class="form-row">
+    <label for="case">Case (optional)</label>
+    <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="auto if blank">
+  </div>
 
-      {% if error %}
-        <div class="error">{{ error }}</div>
+  <div class="form-row">
+    <label for="limit">Limit</label>
+    <input type="number" id="limit" name="limit" value="{{ limit }}">
+  </div>
+
+  <div class="form-row">
+    <label for="urls">Manual URLs</label>
+    <textarea id="urls" name="urls" rows="4"
+      placeholder="One URL per line (optional).&#10;Use this if search returns nothing or you already have the exact links."></textarea>
+  </div>
+
+  <p class="meta">
+    If the search engine blocks or rate-limits server-side queries (common for data-center IPs),
+    paste the document URLs directly in the field above.
+  </p>
+
+  <div class="form-row">
+    <button type="submit">Search &amp; Ingest</button>
+  </div>
+
+  {% if error %}
+    <div class="error">{{ error }}</div>
+  {% endif %}
+</form>
+
+{% if pdf_urls %}
+  <h2>URLs Found from Search</h2>
+  <ul>
+    {% for u in pdf_urls %}
+      <li><code>{{ u }}</code></li>
+    {% endfor %}
+  </ul>
+{% endif %}
+
+{% if ingested %}
+  <h2>Ingest Results</h2>
+  <p class="meta">Case: <strong>{{ case }}</strong></p>
+  {% for item in ingested %}
+    <div class="ingested-item">
+      <div><strong>URL:</strong> <code>{{ item.url }}</code></div>
+      {% if item.error %}
+        <div class="error"><strong>Error:</strong> {{ item.error }}</div>
+      {% else %}
+        {% if item.pdf_path %}
+          <div>PDF: <code>{{ item.pdf_path }}</code></div>
+        {% endif %}
+        {% if item.txt_path %}
+          <div>TXT: <code>{{ item.txt_path }}</code></div>
+        {% endif %}
+        {% if not item.pdf_path and not item.txt_path %}
+          <div class="meta">No paths recorded (unexpected).</div>
+        {% endif %}
       {% endif %}
-    </form>
+    </div>
+  {% endfor %}
+{% endif %}
 
-    {% if pdf_urls %}
-      <h2>URLs Found</h2>
-      <div class="section-card">
-        <ul class="meta">
-          {% for u in pdf_urls %}
-            <li><code>{{ u }}</code></li>
-          {% endfor %}
-        </ul>
-      </div>
-    {% endif %}
-
-    {% if ingested %}
-      <h2>Ingest Results</h2>
-      <p class="meta">Case: <strong>{{ case }}</strong></p>
-      {% for item in ingested %}
-        <div class="ingested-item">
-          <div><strong>URL:</strong> <code>{{ item.url }}</code></div>
-          {% if item.error %}
-            <div class="error"><strong>Error:</strong> {{ item.error }}</div>
-          {% else %}
-            {% if item.pdf_path %}
-              <div class="meta">PDF: <code>{{ item.pdf_path }}</code></div>
-            {% endif %}
-            {% if item.txt_path %}
-              <div class="meta">TXT: <code>{{ item.txt_path }}</code></div>
-            {% endif %}
-            {% if not item.pdf_path and not item.txt_path %}
-              <div class="meta">No paths recorded (unexpected).</div>
-            {% endif %}
-          {% endif %}
-        </div>
-      {% endfor %}
-    {% endif %}
-  </main>
 </body></html>
 """
 
@@ -1034,6 +965,7 @@ def load_ocr_text(path_str: str):
 class SimpleResult:
     doc_id: str
     source: str
+    source_full: str
     case: str | None
     kind: str | None
     snippet: str
@@ -1107,11 +1039,13 @@ def simple_search(q: str, case: str | None, kind: str | None, limit: int = 20) -
 
         raw_source = rec.get("source_url") or rec.get("pdf") or "(local)"
 
-        # Make local filesystem paths less ugly in the UI
+        # Short + full view for local paths
         if isinstance(raw_source, str) and raw_source.startswith("/"):
+            source_full = raw_source
             source = f"local:{Path(raw_source).name}"
         else:
-            source = raw_source
+            source_full = str(raw_source)
+            source = str(raw_source)
 
         score = float(len(matched_tokens) + total_hits / 10.0)
 
@@ -1119,7 +1053,8 @@ def simple_search(q: str, case: str | None, kind: str | None, limit: int = 20) -
         results.append(
             SimpleResult(
                 doc_id=p.stem,
-                source=str(source),
+                source=source,
+                source_full=source_full,
                 case=rec_case,
                 kind=rec_kind,
                 snippet=snippet,
@@ -1132,6 +1067,8 @@ def simple_search(q: str, case: str | None, kind: str | None, limit: int = 20) -
     _log_debug(f"simple_search: returning {len(results[:limit])} result(s)")
     return results[:limit]
 
+
+# ---------- Routes ----------
 
 # ---------- Routes ----------
 
@@ -1187,12 +1124,23 @@ def case_view(case_name: str):
         if not txt:
             continue
 
+        # Pretty PDF display (filename only) + full path for potential future tooltips
+        pdf_display = None
+        pdf_full = None
+        if isinstance(pdf, str) and pdf:
+            pdf_full = pdf
+            if pdf.startswith("/"):
+                pdf_display = Path(pdf).name
+            else:
+                pdf_display = pdf
+
         p = Path(txt)
         docs.append(
             {
                 "doc_id": p.stem,
                 "kind": rec.get("kind"),
-                "pdf": pdf,
+                "pdf": pdf_display,
+                "pdf_full": pdf_full,
                 "source_url": source_url,
             }
         )
@@ -1212,7 +1160,19 @@ def doc_view(doc_id: str):
         abort(404, description=f"No manifest record found for doc_id={doc_id!r}")
 
     txt_path = rec.get("txt")
+
     content, error = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing.")
+
+    # Handle PDF display + full path
+    raw_pdf = rec.get("pdf")
+    pdf_display = None
+    pdf_full = None
+    if isinstance(raw_pdf, str) and raw_pdf:
+        pdf_full = raw_pdf
+        if raw_pdf.startswith("/"):
+            pdf_display = Path(raw_pdf).name
+        else:
+            pdf_display = raw_pdf
 
     return render_template_string(
         DOC_TEMPLATE,
@@ -1220,7 +1180,8 @@ def doc_view(doc_id: str):
         doc_id=doc_id,
         case_name=rec.get("case"),
         kind=rec.get("kind"),
-        pdf=rec.get("pdf"),
+        pdf=pdf_display,
+        pdf_full=pdf_full,
         source_url=rec.get("source_url"),
         content=content,
         error=error,
@@ -1232,6 +1193,10 @@ def web_ingest():
     """
     Web-ingest is available to *any* nginx-authenticated user.
     Nginx basic auth is the real gate; Flask does not ask for another login.
+
+    Two modes:
+      - Search-based: use DuckDuckGo HTML to discover doc-like URLs.
+      - Manual: user pastes one or more URLs (one per line).
     """
     query = ""
     case = ""
@@ -1244,51 +1209,80 @@ def web_ingest():
         query = (request.form.get("q") or "").strip()
         case = (request.form.get("case") or "").strip()
         limit_raw = (request.form.get("limit") or "").strip()
+        manual_raw = (request.form.get("urls") or "").strip()
 
+        # Parse limit
         try:
             limit = int(limit_raw) if limit_raw else 5
         except ValueError:
             error = "Limit must be an integer."
             limit = 5
 
-        if not error:
-            if not query:
-                error = "Query is required."
-            else:
-                # Auto-generate case if blank
-                if not case:
-                    slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
-                    case = f"{slug}_web" if slug else "web"
+        # Normalize / auto-generate case
+        if not case:
+            # Use query slug if we have a query; otherwise a generic "web" case
+            base = query or "web"
+            slug = re.sub(r"[^a-z0-9]+", "_", base.lower()).strip("_")
+            case = f"{slug}_web" if slug else "web"
 
+        # Manual URLs: one per line, ignore blank lines / non-http
+        manual_urls: list[str] = []
+        if manual_raw:
+            for line in manual_raw.splitlines():
+                u = line.strip()
+                if not u:
+                    continue
+                if not u.startswith("http"):
+                    # Be strict here; we can relax later if needed
+                    continue
+                manual_urls.append(u)
+
+        # If we got manual URLs, we don't *need* to hit DuckDuckGo
+        urls_to_ingest: list[str] = []
+
+        if manual_urls:
+            urls_to_ingest.extend(manual_urls)
+        elif not error:
+            # Only run search if there was no limit error and no manual URLs
+            if not query:
+                error = "Query is required if you are not providing manual URLs."
+            else:
                 try:
                     pdf_urls = fetch_doc_urls(query, limit=limit)
                 except Exception as e:
                     error = f"Web search failed: {e}"
 
                 if not error and not pdf_urls:
-                    error = "No document-like URLs found in search results."
+                    error = (
+                        "No document-like URLs found in search results. "
+                        "The search engine may be limiting server-side access from this server. "
+                        "Try a different query, or paste the URLs directly in the Manual URLs box."
+                    )
 
-                if not error:
-                    for url in pdf_urls:
-                        try:
-                            pdf_path, txt_path = ingest_url_web(url, case=case)
-                            ingested.append(
-                                {
-                                    "url": url,
-                                    "pdf_path": str(pdf_path) if pdf_path else None,
-                                    "txt_path": str(txt_path) if txt_path else None,
-                                    "error": None,
-                                }
-                            )
-                        except Exception as e:
-                            ingested.append(
-                                {
-                                    "url": url,
-                                    "pdf_path": None,
-                                    "txt_path": None,
-                                    "error": str(e),
-                                }
-                            )
+                urls_to_ingest.extend(pdf_urls)
+
+        # Actually ingest
+        if not error and urls_to_ingest:
+            for url in urls_to_ingest:
+                try:
+                    pdf_path, txt_path = ingest_url_web(url, case=case)
+                    ingested.append(
+                        {
+                            "url": url,
+                            "pdf_path": str(pdf_path) if pdf_path else None,
+                            "txt_path": str(txt_path) if txt_path else None,
+                            "error": None,
+                        }
+                    )
+                except Exception as e:
+                    ingested.append(
+                        {
+                            "url": url,
+                            "pdf_path": None,
+                            "txt_path": None,
+                            "error": str(e),
+                        }
+                    )
 
     return render_template_string(
         WEB_INGEST_TEMPLATE,
@@ -1299,8 +1293,7 @@ def web_ingest():
         error=error,
         pdf_urls=pdf_urls,
         ingested=ingested,
-    )
-
+    )         
 
 if __name__ == "__main__":
     # Dev mode only; production should use gunicorn behind nginx.

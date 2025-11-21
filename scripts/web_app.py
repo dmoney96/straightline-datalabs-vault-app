@@ -8,7 +8,6 @@ import re
 import io
 import csv
 import os
-from functools import wraps
 from urllib.parse import urlparse, parse_qs, unquote
 
 import requests
@@ -20,7 +19,6 @@ from flask import (
     abort,
     redirect,
     url_for,
-    session,
 )
 
 # Optional DOCX support
@@ -40,35 +38,17 @@ from vault_core.ingest.pipeline import ingest_source  # type: ignore[import]
 from vault_core.paths import DATA_DIR, OCR_DIR  # type: ignore[import]
 
 app = Flask(__name__)
-
-# ---------- Auth / config ----------
-
 app.secret_key = os.getenv("STRAIGHTLINE_SECRET_KEY", "dev-not-secret")
-ADMIN_USER = os.getenv("STRAIGHTLINE_ADMIN_USER", "admin")
-ADMIN_PASSWORD = os.getenv("STRAIGHTLINE_ADMIN_PASSWORD", "change-me")
-
-
-def login_required(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        if not session.get("logged_in"):
-            return redirect(url_for("login", next=request.path))
-        return view(*args, **kwargs)
-
-    return wrapped
 
 
 # ---------- Debug helper ----------
 
-
 def _log_debug(msg: str) -> None:
-    """
-    Simple stderr logger so messages show up in journalctl.
-    """
+    """Simple stderr logger so messages show up in journalctl."""
     print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
 
 
-# ---------- Web search helpers ----------
+# ---------- Web search helpers (DuckDuckGo HTML) ----------
 
 DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/html/"
 
@@ -77,7 +57,6 @@ def _extract_real_url(href: str) -> str:
     """
     DuckDuckGo often wraps outbound links as /l/?uddg=<encoded_url>
     OR https://duckduckgo.com/l/?uddg=<encoded_url>.
-
     This helper unwraps both styles when present.
     """
     parsed = urlparse(href)
@@ -102,9 +81,7 @@ def _extract_real_url(href: str) -> str:
 def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
     """
     Use DuckDuckGo's HTML endpoint to find document-like URLs.
-
-    First try POST to html.duckduckgo.com/html (the "lite" interface),
-    then fall back to GET on duckduckgo.com/html if needed.
+    We keep it broad and let ingest_url_web decide how to treat each URL.
     """
     _log_debug(f"fetch_doc_urls: query={query!r}, limit={limit}")
 
@@ -160,7 +137,7 @@ def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
 
     urls: list[str] = []
 
-    # --- Try POST to the html.duckduckgo.com "lite" endpoint first
+    # Try POST to html.duckduckgo.com first
     try:
         resp_post = requests.post(
             "https://html.duckduckgo.com/html/",
@@ -172,7 +149,7 @@ def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
     except Exception as e:
         _log_debug(f"ddg_post_error={e!r}")
 
-    # --- Fallback: GET on duckduckgo.com/html if POST didn't yield anything
+    # Fallback: GET on duckduckgo.com/html
     if not urls:
         try:
             resp_get = requests.get(
@@ -191,11 +168,8 @@ def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
 
 # ---------- Ingest helpers for ANY URL ----------
 
-
 def _slug_from_url(url: str) -> str:
-    """
-    Turn a URL into a filesystem-safe slug for TXT filenames.
-    """
+    """Turn a URL into a filesystem-safe slug for TXT filenames."""
     parsed = urlparse(url)
     base = (parsed.netloc + parsed.path).lower()
     slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
@@ -238,9 +212,7 @@ def _write_txt_and_manifest(
 
 
 def _extract_docx_text(content: bytes) -> str:
-    """
-    Extract plain text from a DOCX file (in-memory bytes) using python-docx.
-    """
+    """Extract plain text from DOCX (in-memory bytes) using python-docx."""
     if Document is None:
         raise RuntimeError(
             "python-docx is not installed. Install it with 'pip install python-docx'."
@@ -259,7 +231,6 @@ def _extract_docx_text(content: bytes) -> str:
 def _extract_csv_text(text: str) -> str:
     """
     Flatten CSV text into a readable, line-based text block for indexing.
-    Keeps it simple: join cells with tabs and rows with newlines.
     """
     out_lines: list[str] = []
     reader = csv.reader(text.splitlines())
@@ -271,12 +242,13 @@ def _extract_csv_text(text: str) -> str:
 def ingest_url_web(url: str, case: str | None):
     """
     Ingest an arbitrary URL:
+
       - If it's a PDF -> delegate to ingest_source (existing pipeline).
       - If it's DOCX -> extract text via python-docx -> web_docx.
       - If it's CSV -> flatten rows -> web_csv.
       - If it's HTML -> strip to text and record as web_html.
       - If it's text/* -> record as web_text.
-      - Otherwise -> raise ValueError so the UI can show an error.
+
     Returns (pdf_path, txt_path) where pdf_path may be None.
     """
     headers = {
@@ -296,7 +268,7 @@ def ingest_url_web(url: str, case: str | None):
         head_resp = None
         ctype = ""
 
-    # ---- PDF: existing pipeline
+    # PDF: existing pipeline
     if "pdf" in ctype or url.lower().endswith(".pdf"):
         pdf_path, txt_path = ingest_source(url, case=case)
         return pdf_path, txt_path
@@ -307,7 +279,7 @@ def ingest_url_web(url: str, case: str | None):
     if not ctype:
         ctype = (resp.headers.get("Content-Type") or "").lower()
 
-    # ---- DOCX
+    # DOCX
     if (
         "officedocument.wordprocessingml.document" in ctype
         or url.lower().endswith(".docx")
@@ -316,27 +288,27 @@ def ingest_url_web(url: str, case: str | None):
         txt_path = _write_txt_and_manifest(text, url, case, kind="web_docx")
         return None, txt_path
 
-    # ---- CSV
+    # CSV
     if "text/csv" in ctype or url.lower().endswith(".csv"):
         raw_text = resp.text
         text = _extract_csv_text(raw_text)
         txt_path = _write_txt_and_manifest(text, url, case, kind="web_csv")
         return None, txt_path
 
-    # ---- HTML
+    # HTML
     if "html" in ctype or url.lower().endswith((".htm", ".html", "/")):
         soup = BeautifulSoup(resp.text, "html_parser" if False else "html.parser")
         text = soup.get_text("\n", strip=True)
         txt_path = _write_txt_and_manifest(text, url, case, kind="web_html")
         return None, txt_path
 
-    # ---- Generic text/*
+    # Generic text/*
     if ctype.startswith("text/"):
         text = resp.text
         txt_path = _write_txt_and_manifest(text, url, case, kind="web_text")
         return None, txt_path
 
-    # ---- Fallback: unsupported for now
+    # Fallback
     raise ValueError(f"Unsupported content type for web ingest: {ctype or 'unknown'}")
 
 
@@ -367,41 +339,8 @@ BASE_STYLE = """
 </style>
 """
 
+
 # ---------- Templates ----------
-
-LOGIN_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Straightline Vault — Login</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-</nav>
-
-<h1>Admin Login</h1>
-<p class="meta">You must log in to access admin and ingest functions.</p>
-
-<form method="post" action="/login">
-  <div>
-    <label for="username">User</label>
-    <input type="text" id="username" name="username" autofocus>
-  </div>
-  <div>
-    <label for="password">Pass</label>
-    <input type="password" id="password" name="password">
-  </div>
-  <div style="margin-top: 0.5rem;">
-    <button type="submit">Log in</button>
-  </div>
-  {% if error %}
-    <div class="error">{{ error }}</div>
-  {% endif %}
-</form>
-
-</body></html>
-"""
 
 INDEX_TEMPLATE = """
 <!doctype html>
@@ -414,16 +353,10 @@ INDEX_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
-  {% if session.logged_in %}
-    <a href="/admin">Admin</a>
-    <a href="/logout">Logout</a>
-  {% else %}
-    <a href="/login">Login</a>
-  {% endif %}
 </nav>
 
 <h1>Straightline Vault</h1>
-<p class="meta">Full-text search across your ingested cases.</p>
+<p class="meta">Full-text search across your ingested corpus. Nginx basic auth protects this interface.</p>
 
 <form method="get" action="/">
   <div>
@@ -484,8 +417,6 @@ CASES_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
-  <a href="/admin">Admin</a>
-  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Cases</h1>
@@ -527,8 +458,6 @@ CASE_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
-  <a href="/admin">Admin</a>
-  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Case: {{ case_name }}</h1>
@@ -575,8 +504,6 @@ DOC_TEMPLATE = """
     <a href="/case/{{ case_name }}">Back to case</a>
   {% endif %}
   <a href="/web-ingest">Web Ingest</a>
-  <a href="/admin">Admin</a>
-  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Document: {{ doc_id }}</h1>
@@ -608,8 +535,6 @@ WEB_INGEST_TEMPLATE = """
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
   <a href="/web-ingest">Web Ingest</a>
-  <a href="/admin">Admin</a>
-  <a href="/logout">Logout</a>
 </nav>
 
 <h1>Web Ingest</h1>
@@ -621,7 +546,7 @@ WEB_INGEST_TEMPLATE = """
 <form method="post" action="/web-ingest">
   <div>
     <label for="q">Query</label>
-    <input type="text" id="q" name="q" value="{{ query|e }}" placeholder="e.g. IRS publication 463">
+    <input type="text" id="q" name="q" value="{{ query|e }}" placeholder="e.g. Jamal Khashoggi CIA report">
   </div>
 
   <div>
@@ -675,8 +600,8 @@ WEB_INGEST_TEMPLATE = """
 </body></html>
 """
 
-# ---------- Helpers ----------
 
+# ---------- Helpers ----------
 
 def build_case_stats():
     stats = defaultdict(lambda: {"total": 0, "kinds": defaultdict(int)})
@@ -716,7 +641,6 @@ def load_ocr_text(path_str: str):
 
 # ---------- Routes ----------
 
-
 @app.route("/", methods=["GET"])
 def index():
     q = request.args.get("q", "").strip()
@@ -742,45 +666,7 @@ def index():
     )
 
 
-@app.route("/login", methods=["GET", "POST"])
-def login():
-    error = None
-    if request.method == "POST":
-        username = (request.form.get("username") or "").strip()
-        password = request.form.get("password") or ""
-        if username == ADMIN_USER and password == ADMIN_PASSWORD:
-            session["logged_in"] = True
-            next_url = request.args.get("next") or url_for("admin_home")
-            return redirect(next_url)
-        else:
-            error = "Invalid username or password."
-
-    return render_template_string(
-        LOGIN_TEMPLATE,
-        style=BASE_STYLE,
-        error=error,
-    )
-
-
-@app.route("/logout", methods=["GET"])
-def logout():
-    session.clear()
-    return redirect(url_for("index"))
-
-
-@app.route("/admin", methods=["GET"])
-@login_required
-def admin_home():
-    stats = build_case_stats()
-    return render_template_string(
-        CASES_TEMPLATE,
-        style=BASE_STYLE,
-        cases=stats,
-    )
-
-
 @app.route("/cases", methods=["GET"])
-@login_required
 def cases_view():
     return render_template_string(
         CASES_TEMPLATE,
@@ -790,7 +676,6 @@ def cases_view():
 
 
 @app.route("/case/<case_name>", methods=["GET"])
-@login_required
 def case_view(case_name: str):
     docs = []
     for rec in iter_manifest() or []:
@@ -823,7 +708,6 @@ def case_view(case_name: str):
 
 
 @app.route("/doc/<doc_id>", methods=["GET"])
-@login_required
 def doc_view(doc_id: str):
     rec = find_manifest_by_doc_id(doc_id)
     if not rec:
@@ -846,8 +730,11 @@ def doc_view(doc_id: str):
 
 
 @app.route("/web-ingest", methods=["GET", "POST"])
-@login_required
 def web_ingest():
+    """
+    Web-ingest is available to *any* nginx-authenticated user.
+    Nginx basic auth is the real gate; Flask does not ask for another login.
+    """
     query = ""
     case = ""
     limit = 5
@@ -918,5 +805,5 @@ def web_ingest():
 
 
 if __name__ == "__main__":
-    # Dev mode only; production should use gunicorn/uvicorn behind nginx.
+    # Dev mode only; production should use gunicorn behind nginx.
     app.run(host="127.0.0.1", port=5001, debug=True)
