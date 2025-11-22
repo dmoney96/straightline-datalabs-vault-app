@@ -297,7 +297,7 @@ def ingest_url_web(url: str, case: str | None):
 
     # HTML
     if "html" in ctype or url.lower().endswith((".htm", ".html", "/")):
-        soup = BeautifulSoup(resp.text, "html_parser" if False else "html.parser")
+        soup = BeautifulSoup(resp.text, "html.parser")
         text = soup.get_text("\n", strip=True)
         txt_path = _write_txt_and_manifest(text, url, case, kind="web_html")
         return None, txt_path
@@ -316,29 +316,118 @@ def ingest_url_web(url: str, case: str | None):
 
 BASE_STYLE = """
 <style>
-  body { font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; margin: 2rem; max-width: 960px; }
-  h1 { margin-bottom: 0.25rem; }
-  h2 { margin-top: 1.5rem; }
-  a { text-decoration: none; }
-  a:hover { text-decoration: underline; }
-  form { margin-bottom: 1.5rem; }
-  label { display: inline-block; min-width: 4.5rem; }
-  input[type="text"] { width: 25rem; }
-  .meta { color: #555; font-size: 0.9rem; }
-  .result { border-bottom: 1px solid #ccc; padding: 0.75rem 0; }
-  .snippet { margin-top: 0.5rem; }
-  .score { font-size: 0.85rem; color: #666; }
-  code { font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; }
-  nav a { margin-right: 1rem; font-size: 0.95rem; }
-  table { border-collapse: collapse; width: 100%; }
-  th, td { border-bottom: 1px solid #ddd; padding: 0.4rem 0.25rem; text-align: left; }
-  th { font-weight: 600; }
-  pre { white-space: pre-wrap; font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace; font-size: 0.9rem; }
-  .error { color: #b00020; margin-top: 0.5rem; }
-  .ingested-item { border-bottom: 1px solid #ccc; padding: 0.5rem 0; }
+  :root {
+    color-scheme: dark;
+  }
+
+  body {
+    background: #05070b;
+    color: #e7ecf5;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    margin: 2rem;
+    max-width: 960px;
+  }
+
+  a {
+    color: #7fb4ff;
+    text-decoration: none;
+  }
+  a:hover {
+    text-decoration: underline;
+  }
+
+  nav {
+    margin-bottom: 1.5rem;
+  }
+  nav a {
+    margin-right: 1rem;
+    font-size: 0.95rem;
+  }
+
+  h1 {
+    margin-bottom: 0.25rem;
+  }
+  h2 {
+    margin-top: 1.5rem;
+  }
+
+  form {
+    margin-bottom: 1.5rem;
+  }
+  label {
+    display: inline-block;
+    min-width: 4.5rem;
+  }
+  input[type="text"],
+  input[type="number"] {
+    width: 25rem;
+    background: #111827;
+    border: 1px solid #374151;
+    color: #e7ecf5;
+    padding: 0.35rem 0.5rem;
+    border-radius: 4px;
+  }
+
+  button {
+    background: #2563eb;
+    border: none;
+    color: #f9fafb;
+    padding: 0.35rem 0.9rem;
+    border-radius: 4px;
+    cursor: pointer;
+  }
+  button:hover {
+    background: #1d4ed8;
+  }
+
+  .meta {
+    color: #9ca3af;
+    font-size: 0.9rem;
+  }
+
+  .result {
+    border-bottom: 1px solid #1f2937;
+    padding: 0.75rem 0;
+  }
+
+  .snippet {
+    margin-top: 0.5rem;
+  }
+
+  .score {
+    font-size: 0.85rem;
+    color: #9ca3af;
+  }
+
+  code, pre {
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-size: 0.9rem;
+  }
+
+  table {
+    border-collapse: collapse;
+    width: 100%;
+  }
+  th, td {
+    border-bottom: 1px solid #1f2937;
+    padding: 0.4rem 0.25rem;
+    text-align: left;
+  }
+  th {
+    font-weight: 600;
+  }
+
+  .error {
+    color: #f97373;
+    margin-top: 0.5rem;
+  }
+
+  .ingested-item {
+    border-bottom: 1px solid #1f2937;
+    padding: 0.5rem 0;
+  }
 </style>
 """
-
 
 # ---------- Templates ----------
 
@@ -632,7 +721,8 @@ def load_ocr_text(path_str: str):
     try:
         p = Path(path_str)
         if not p.is_absolute():
-            p = ROOT / p
+            # manifest txt paths are stored relative to DATA_DIR
+            p = DATA_DIR / p
         text = p.read_text(encoding="utf-8", errors="replace")
         return text, None
     except Exception as e:
