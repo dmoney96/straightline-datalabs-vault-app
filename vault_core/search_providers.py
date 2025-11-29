@@ -1,266 +1,309 @@
-#!/usr/bin/env python
 from __future__ import annotations
 
 import os
-import logging
 from dataclasses import dataclass
-from typing import List, Optional, Dict, Any
+from typing import List, Iterable
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import requests
 
-logger = logging.getLogger(__name__)
-
-
-# ---------- Data model ----------
 
 @dataclass
 class SearchResult:
-    provider: str
-    query: str
-    title: str
+    """
+    Minimal search result shape exposed to callers.
+
+    The rest of your app only *needs* .url, but we also
+    carry title/snippet for future UI use if desired.
+    """
     url: str
-    snippet: str
-    rank: int
-    raw: Dict[str, Any]
+    title: str | None = None
+    snippet: str | None = None
+    provider: str | None = None
 
 
-# ---------- Base class ----------
-
-class BaseSearchProvider:
-    name: str = "base"
-
-    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
-        raise NotImplementedError
+class MetasearchError(RuntimeError):
+    pass
 
 
-# ---------- Brave Search Provider ----------
+# Global timeout knobs for all providers (seconds)
+CONNECT_TIMEOUT = 5.0
+READ_TIMEOUT = 10.0
+PROVIDER_TIMEOUT = 8.0          # max time we'll wait per provider
+GLOBAL_TIMEOUT_MARGIN = 2.0     # global wait for as_completed
 
-class BraveSearchProvider(BaseSearchProvider):
+
+def _brave_search(query: str, max_results: int = 10) -> List[SearchResult]:
     """
-    Uses Brave Search API.
-    Env var: BRAVE_SEARCH_API_KEY
-    Docs: https://api.search.brave.com/app/documentation
+    Brave Search API.
+    Requires env BRAVE_API_KEY set to a Brave subscription token.
     """
-    name = "brave"
+    api_key = os.getenv("BRAVE_API_KEY")
+    if not api_key:
+        # Not configured; just opt-out gracefully
+        return []
 
-    def __init__(self, api_key: Optional[str] = None):
-        # Accept either BRAVE_SEARCH_API_KEY (preferred) or BRAVE_API_KEY (fallback)
-        self.api_key = (
-            api_key
-            or os.getenv("BRAVE_SEARCH_API_KEY")
-            or os.getenv("BRAVE_API_KEY")
+    endpoint = "https://api.search.brave.com/res/v1/web/search"
+
+    headers = {
+        "Accept": "application/json",
+        "X-Subscription-Token": api_key,
+        "User-Agent": "StraightlineVault/0.1 (+non-malicious investigative use)",
+    }
+
+    params = {
+        "q": query,
+        "count": max_results,
+        # You can tune these:
+        # "country": "us",
+        # "safesearch": "off",
+    }
+
+    resp = requests.get(
+        endpoint,
+        headers=headers,
+        params=params,
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+    )
+    resp.raise_for_status()
+
+    try:
+        data = resp.json()
+    except ValueError as e:
+        raise MetasearchError(f"Brave Search returned non-JSON: {e}") from e
+
+    web = data.get("web", {})
+    items = web.get("results") or []
+
+    results: List[SearchResult] = []
+    for item in items:
+        url = item.get("url")
+        if not url:
+            continue
+        title = item.get("title")
+        snippet = item.get("description") or item.get("snippet")
+        results.append(
+            SearchResult(
+                url=url,
+                title=title,
+                snippet=snippet,
+                provider="brave",
+            )
         )
-        if not self.api_key:
-            raise RuntimeError("BRAVE_SEARCH_API_KEY (or BRAVE_API_KEY) is not set")
+    return results
 
-        self.endpoint = "https://api.search.brave.com/res/v1/web/search"
 
-    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
-        params = {
-            "q": query,
-            "count": max_results,
-        }
-        headers = {
-            "Accept": "application/json",
-            "X-Subscription-Token": self.api_key,
-            "User-Agent": "StraightlineVault/0.1",
-        }
+def _google_cse_search(query: str, max_results: int = 10) -> List[SearchResult]:
+    """
+    Google Programmable Search Engine (Custom Search).
+    Requires:
+      - env GOOGLE_API_KEY
+      - env GOOGLE_CSE_CX
+    If either is missing, this provider is silently disabled.
+    """
+    api_key = os.getenv("GOOGLE_API_KEY")
+    cx = os.getenv("GOOGLE_CSE_CX")
 
-        resp = requests.get(self.endpoint, params=params, headers=headers, timeout=20)
-        resp.raise_for_status()
+    if not api_key or not cx:
+        return []
+
+    endpoint = "https://www.googleapis.com/customsearch/v1"
+
+    params = {
+        "key": api_key,
+        "cx": cx,
+        "q": query,
+        "num": min(max_results, 10),  # Google caps at 10 per request
+    }
+
+    resp = requests.get(
+        endpoint,
+        params=params,
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+    )
+    resp.raise_for_status()
+
+    try:
         data = resp.json()
+    except ValueError as e:
+        raise MetasearchError(f"Google CSE returned non-JSON: {e}") from e
 
-        web_results = data.get("web", {}).get("results", [])
-        results: List[SearchResult] = []
+    items = data.get("items") or []
 
-        for idx, item in enumerate(web_results[:max_results], start=1):
-            results.append(
-                SearchResult(
-                    provider=self.name,
-                    query=query,
-                    title=item.get("title", ""),
-                    url=item.get("url", ""),
-                    snippet=item.get("description", "") or item.get("snippet", ""),
-                    rank=idx,
-                    raw=item,
-                )
+    results: List[SearchResult] = []
+    for item in items:
+        url = item.get("link")
+        if not url:
+            continue
+        title = item.get("title")
+        snippet = item.get("snippet")
+        results.append(
+            SearchResult(
+                url=url,
+                title=title,
+                snippet=snippet,
+                provider="google_cse",
             )
+        )
 
-        return results
+    return results
 
 
-# ---------- Google Programmable Search Provider ----------
-
-class GoogleCSEProvider(BaseSearchProvider):
+def _serpapi_search(query: str, max_results: int = 10) -> List[SearchResult]:
     """
-    Uses Google Custom/Programmable Search JSON API.
-    Env vars: GOOGLE_API_KEY, GOOGLE_CSE_ID
-    Docs: https://developers.google.com/custom-search/v1/overview
+    SerpAPI as another provider.
+    Requires env SERPAPI_API_KEY.
+    You can tweak engine/location as needed.
     """
-    name = "google_cse"
+    api_key = os.getenv("SERPAPI_API_KEY")
+    if not api_key:
+        return []
 
-    def __init__(
-        self,
-        api_key: Optional[str] = None,
-        cse_id: Optional[str] = None,
-    ):
-        self.api_key = api_key or os.getenv("GOOGLE_API_KEY")
-        self.cse_id = cse_id or os.getenv("GOOGLE_CSE_ID")
+    endpoint = "https://serpapi.com/search"
 
-        if not self.api_key or not self.cse_id:
-            raise RuntimeError("GOOGLE_API_KEY or GOOGLE_CSE_ID not set")
+    params = {
+        "api_key": api_key,
+        "engine": "google",
+        "q": query,
+        "num": max_results,
+    }
 
-        self.endpoint = "https://www.googleapis.com/customsearch/v1"
+    resp = requests.get(
+        endpoint,
+        params=params,
+        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+    )
+    resp.raise_for_status()
 
-    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
-        params = {
-            "key": self.api_key,
-            "cx": self.cse_id,
-            "q": query,
-            "num": min(max_results, 10),  # Google max per request is 10
-        }
-
-        resp = requests.get(self.endpoint, params=params, timeout=20)
-        resp.raise_for_status()
+    try:
         data = resp.json()
+    except ValueError as e:
+        raise MetasearchError(f"SerpAPI returned non-JSON: {e}") from e
 
-        items = data.get("items", []) or []
-        results: List[SearchResult] = []
+    items = data.get("organic_results") or []
 
-        for idx, item in enumerate(items[:max_results], start=1):
-            results.append(
-                SearchResult(
-                    provider=self.name,
-                    query=query,
-                    title=item.get("title", ""),
-                    url=item.get("link", ""),
-                    snippet=item.get("snippet", ""),
-                    rank=idx,
-                    raw=item,
-                )
+    results: List[SearchResult] = []
+    for item in items:
+        url = item.get("link")
+        if not url:
+            continue
+        title = item.get("title")
+        snippet = item.get("snippet") or item.get("description")
+        results.append(
+            SearchResult(
+                url=url,
+                title=title,
+                snippet=snippet,
+                provider="serpapi",
             )
+        )
 
-        return results
+    return results
 
 
-# ---------- SerpAPI Provider (Google wrapper) ----------
-
-class SerpAPIProvider(BaseSearchProvider):
+def _enabled_providers():
     """
-    Uses SerpAPI (Google wrapper).
-    Env var: SERPAPI_KEY
-    Docs: https://serpapi.com/
+    Decide which providers are *logically* enabled based on env vars.
+    This keeps metasearch a true 'meta' layer.
     """
-    name = "serpapi"
+    providers = []
 
-    def __init__(self, api_key: Optional[str] = None):
-        self.api_key = api_key or os.getenv("SERPAPI_KEY")
-        if not self.api_key:
-            raise RuntimeError("SERPAPI_KEY is not set")
+    # Brave
+    if os.getenv("BRAVE_API_KEY"):
+        providers.append(("brave", _brave_search))
 
-        self.endpoint = "https://serpapi.com/search.json"
+    # Google CSE
+    if os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_CSE_CX"):
+        providers.append(("google_cse", _google_cse_search))
 
-    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
-        params = {
-            "engine": "google",
-            "q": query,
-            "num": min(max_results, 10),
-            "api_key": self.api_key,
-        }
+    # SerpAPI
+    if os.getenv("SERPAPI_API_KEY"):
+        providers.append(("serpapi", _serpapi_search))
 
-        resp = requests.get(self.endpoint, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-
-        items = data.get("organic_results", []) or []
-        results: List[SearchResult] = []
-
-        for idx, item in enumerate(items[:max_results], start=1):
-            results.append(
-                SearchResult(
-                    provider=self.name,
-                    query=query,
-                    title=item.get("title", ""),
-                    url=item.get("link", ""),
-                    snippet=item.get("snippet", ""),
-                    rank=idx,
-                    raw=item,
-                )
-            )
-
-        return results
+    return providers
 
 
-# ---------- Metasearch ----------
-
-def metasearch(
-    query: str,
-    max_results: int = 20,
-    providers: Optional[List[BaseSearchProvider]] = None,
-) -> List[SearchResult]:
+def metasearch(query: str, max_results: int = 10) -> Iterable[SearchResult]:
     """
-    Run a query across multiple providers and return a merged, de-duplicated list.
-    De-dupe is by URL; first occurrence wins.
+    Public metasearch entry point.
+
+    - Fans out to all configured providers in parallel.
+    - Enforces per-provider timeouts.
+    - Deduplicates by URL.
+    - Returns up to `max_results` SearchResult objects.
+
+    Raises MetasearchError if *no* providers are configured,
+    or all providers fail / return nothing.
     """
     query = (query or "").strip()
     if not query:
         return []
 
-    if providers is None:
-        providers = []
+    providers = _enabled_providers()
+    if not providers:
+        raise MetasearchError(
+            "No web search providers configured. Set BRAVE_API_KEY and/or "
+            "GOOGLE_API_KEY + GOOGLE_CSE_CX and/or SERPAPI_API_KEY."
+        )
 
-        # Brave as primary general engine
+    results: List[SearchResult] = []
+    seen_urls: set[str] = set()
+
+    # Submit all providers in parallel with their own internal HTTP timeouts.
+    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
+        future_to_name = {
+            pool.submit(_run_provider_safe, name, func, query, max_results): name
+            for (name, func) in providers
+        }
+
+        # Global timeout guard so we don't hang forever even if a provider ignores timeouts.
         try:
-            providers.append(BraveSearchProvider())
+            for fut in as_completed(
+                future_to_name, timeout=PROVIDER_TIMEOUT + GLOBAL_TIMEOUT_MARGIN
+            ):
+                try:
+                    provider_results = fut.result()
+                except MetasearchError:
+                    # Already logged inside _run_provider_safe
+                    continue
+                except Exception as e:
+                    # Shouldn't usually happen, but don't let it crash the meta layer
+                    print(f"[metasearch] provider {future_to_name[fut]} raised: {e}")
+                    continue
+
+                for r in provider_results:
+                    if r.url in seen_urls:
+                        continue
+                    seen_urls.add(r.url)
+                    results.append(r)
+                    if len(results) >= max_results:
+                        break
+                if len(results) >= max_results:
+                    break
         except Exception as e:
-            logger.warning("Brave provider not available: %s", e)
+            # If as_completed times out or something odd happens
+            print(f"[metasearch] global timeout or error: {e}")
 
-        # Google CSE optional curated engine
-        try:
-            providers.append(GoogleCSEProvider())
-        except Exception as e:
-            logger.warning("Google CSE provider not available: %s", e)
+    if not results:
+        raise MetasearchError("All web search providers failed or returned no results.")
 
-        # SerpAPI as extra Google wrapper
-        try:
-            providers.append(SerpAPIProvider())
-        except Exception as e:
-            logger.warning("SerpAPI provider not available: %s", e)
-
-        if not providers:
-            raise RuntimeError("No search providers configured")
-
-    seen_urls = set()
-    merged: List[SearchResult] = []
-
-    per_provider_target = max(5, max_results // max(1, len(providers)))
-
-    for provider in providers:
-        try:
-            results = provider.search(query, max_results=per_provider_target)
-        except Exception as e:
-            logger.error("Error from provider %s: %s", provider.name, e)
-            continue
-
-        for res in results:
-            if not res.url or not res.url.startswith("http"):
-                continue
-            if res.url in seen_urls:
-                continue
-            seen_urls.add(res.url)
-            merged.append(res)
-
-            if len(merged) >= max_results:
-                break
-
-        if len(merged) >= max_results:
-            break
-
-    return merged
+    return results
 
 
-if __name__ == "__main__":
-    logging.basicConfig(level=logging.INFO)
-    q = "jeffrey epstein court documents pdf"
-    for r in metasearch(q, max_results=10):
-        print(f"[{r.provider}] {r.title} -> {r.url}")
+def _run_provider_safe(
+    name: str,
+    func,
+    query: str,
+    max_results: int,
+) -> List[SearchResult]:
+    """
+    Helper to run a provider with a per-provider timeout and
+    nice error reporting.
+    """
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(func, query, max_results)
+            return future.result(timeout=PROVIDER_TIMEOUT)
+    except Exception as e:
+        print(f"[metasearch] provider {name} error: {e}")
+        raise MetasearchError(f"Provider {name} failed: {e}") from e

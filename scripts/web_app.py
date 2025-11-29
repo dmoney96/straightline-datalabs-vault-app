@@ -1,14 +1,17 @@
 #!/usr/bin/env python
 from __future__ import annotations
-
+from flask import current_app
+from datetime import datetime
 from collections import defaultdict
 from pathlib import Path
+from urllib.parse import urlparse
 import sys
 import re
 import io
 import csv
 import os
-from urllib.parse import urlparse, parse_qs, unquote
+import json
+import time
 
 import requests
 from bs4 import BeautifulSoup
@@ -17,8 +20,6 @@ from flask import (
     request,
     render_template_string,
     abort,
-    redirect,
-    url_for,
 )
 
 # Optional DOCX support
@@ -27,18 +28,39 @@ try:
 except ImportError:  # pragma: no cover
     Document = None
 
-# Ensure project root is on sys.path
+# Ensure project root is on sys.path BEFORE importing vault_core
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vault_core.search_backend import run_search  # type: ignore[import]
+from vault_core.search_backend import run_search, index_txt_document  # type: ignore[import]
 from vault_core.manifest import iter_manifest, append_manifest_entry  # type: ignore[import]
 from vault_core.ingest.pipeline import ingest_source  # type: ignore[import]
 from vault_core.paths import DATA_DIR, OCR_DIR  # type: ignore[import]
+from vault_core.search_providers import (
+    metasearch,
+    MetasearchError,  # uses Brave / Google CSE / Serp
+)  # type: ignore[import]
+
+import os
+import logging
+
+# DEBUG: show what env key Gunicorn actually sees
+logging.warning(
+    "DEBUG: Boot env SERPAPI_API_KEY startswith=%r",
+    os.getenv("SERPAPI_API_KEY", "")[:8],
+)
+
+# -------------------------------
+# Flask app setup
+# -------------------------------
 
 app = Flask(__name__)
 app.secret_key = os.getenv("STRAIGHTLINE_SECRET_KEY", "dev-not-secret")
+
+# ---------- Job queue paths ----------
+JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
+JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
 
 
 # ---------- Debug helper ----------
@@ -48,125 +70,84 @@ def _log_debug(msg: str) -> None:
     print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
 
 
-# ---------- Web search helpers (DuckDuckGo HTML) ----------
+# ---------- Job queue writer ----------
 
-DUCKDUCKGO_SEARCH_URL = "https://duckduckgo.com/html/"
-
-
-def _extract_real_url(href: str) -> str:
+def enqueue_ingest_job(url: str, case: str | None) -> Path:
     """
-    DuckDuckGo often wraps outbound links as /l/?uddg=<encoded_url>
-    OR https://duckduckgo.com/l/?uddg=<encoded_url>.
-    This helper unwraps both styles when present.
+    Write a small JSON job file into jobs/queue for a background worker.
     """
-    parsed = urlparse(href)
+    JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    ts = int(time.time() * 1000)
+    pid = os.getpid()
+    safe_case = re.sub(r"[^a-z0-9]+", "_", (case or "web").lower()).strip("_")
+    job_name = f"{ts}-{pid}-{safe_case}.json"
+    job_path = JOBS_QUEUE_DIR / job_name
 
-    # Case 1: relative wrapper like /l/?uddg=...
-    if not parsed.scheme and href.startswith("/"):
-        qs = parse_qs(parsed.query)
-        if "uddg" in qs and qs["uddg"]:
-            return unquote(qs["uddg"][0])
-        return href
+    payload = {"url": url, "case": case}
+    job_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
 
-    # Case 2: absolute wrapper like https://duckduckgo.com/l/?uddg=...
-    if parsed.netloc and "duckduckgo.com" in parsed.netloc and parsed.path.startswith("/l"):
-        qs = parse_qs(parsed.query)
-        if "uddg" in qs and qs["uddg"]:
-            return unquote(qs["uddg"][0])
+    _log_debug(f"enqueue_ingest_job: queued {url!r} case={case!r} -> {job_path}")
+    return job_path
 
-    # Otherwise just return original href
-    return href
+# ---------- Web search helpers (metasearch + Brave fallback) ----------
 
+from vault_core.search_providers import (
+    metasearch,
+    MetasearchError,
+    _serpapi_search,  # make sure this import exists at the top
+)
 
-def fetch_doc_urls(query: str, limit: int = 5) -> list[str]:
+def fetch_doc_urls(query: str, limit: int = 10) -> list[str]:
     """
-    Use DuckDuckGo's HTML endpoint to find document-like URLs.
-    We keep it broad and let ingest_url_web decide how to treat each URL.
+    Fetch document URLs for a query.
+
+    First try SerpAPI directly (we know this works),
+    then optionally fall back to metasearch if needed.
     """
-    _log_debug(f"fetch_doc_urls: query={query!r}, limit={limit}")
-
-    params = {"q": query, "kl": "us-en"}
-    headers = {
-        "User-Agent": (
-            "Mozilla/5.0 (X11; Linux x86_64) "
-            "AppleWebKit/537.36 (KHTML, like Gecko) "
-            "Chrome/120.0 Safari/537.36 StraightlineVault/0.1"
-        ),
-        "Accept-Language": "en-US,en;q=0.9",
-    }
-
-    def _parse_response(resp: requests.Response, label: str) -> list[str]:
-        _log_debug(f"{label}: status={resp.status_code}, final_url={resp.url}")
-        resp.raise_for_status()
-
-        snippet = resp.text[:400].replace("\n", "\\n")
-        _log_debug(f"{label}: body_snippet={snippet}")
-
-        soup = BeautifulSoup(resp.text, "html.parser")
-        anchors = soup.find_all("a", href=True)
-        _log_debug(f"{label}: total_anchors={len(anchors)}")
-
-        urls: list[str] = []
-        debug_shown = 0
-
-        for a in anchors:
-            raw_href = a["href"]
-            href = _extract_real_url(raw_href)
-
-            # Skip non-http links
-            if not href.startswith("http"):
-                continue
-
-            netloc = urlparse(href).netloc.lower()
-
-            # Skip DDG internal links after unwrap
-            if "duckduckgo.com" in netloc:
-                continue
-
-            if href not in urls:
-                urls.append(href)
-                if debug_shown < 10:
-                    _log_debug(f"{label}: candidate_url={href}")
-                    debug_shown += 1
-
-            if len(urls) >= limit:
-                break
-
-        _log_debug(f"{label}: returning {len(urls)} url(s)")
-        return urls
-
     urls: list[str] = []
+    limit = max(1, min(limit, 20))
 
-    # Try POST to html.duckduckgo.com first
+    # 1) Try SerpAPI directly
+    current_app.logger.warning(
+        "WEBDEBUG: fetch_doc_urls (serpapi-first): query=%r, limit=%r", query, limit
+    )
     try:
-        resp_post = requests.post(
-            "https://html.duckduckgo.com/html/",
-            data=params,
-            headers=headers,
-            timeout=20,
+        serp_results = _serpapi_search(query, max_results=limit)
+        current_app.logger.warning(
+            "WEBDEBUG: fetch_doc_urls: _serpapi_search returned %d results",
+            len(serp_results),
         )
-        urls = _parse_response(resp_post, "ddg_post")
+        for r in serp_results:
+            # r is a SearchResult dataclass: has .url, .title, .snippet, .provider
+            url = getattr(r, "url", None)
+            if url and url not in urls:
+                urls.append(url)
+        if urls:
+            return urls[:limit]
     except Exception as e:
-        _log_debug(f"ddg_post_error={e!r}")
+        current_app.logger.warning(
+            "WEBDEBUG: fetch_doc_urls: direct SerpAPI failed: %r", e
+        )
 
-    # Fallback: GET on duckduckgo.com/html
-    if not urls:
-        try:
-            resp_get = requests.get(
-                DUCKDUCKGO_SEARCH_URL,
-                params=params,
-                headers=headers,
-                timeout=20,
-            )
-            urls = _parse_response(resp_get, "ddg_get")
-        except Exception as e:
-            _log_debug(f"ddg_get_error={e!r}")
+    # 2) Optional fallback to metasearch (if you want to keep it around)
+    try:
+        current_app.logger.warning(
+            "WEBDEBUG: fetch_doc_urls: falling back to metasearch(max_results=%d)",
+            limit,
+        )
+        results = metasearch(query, max_results=limit)
+        for r in results:
+            url = getattr(r, "url", None)
+            if url and url not in urls:
+                urls.append(url)
+    except MetasearchError as e:
+        current_app.logger.warning(
+            "WEBDEBUG: fetch_doc_urls: metasearch_error after SerpAPI: %r", e
+        )
 
-    _log_debug(f"fetch_doc_urls: final_urls={len(urls)}")
     return urls[:limit]
 
-
-# ---------- Ingest helpers for ANY URL ----------
+# ---------- URL ingest helpers ----------
 
 def _slug_from_url(url: str) -> str:
     """Turn a URL into a filesystem-safe slug for TXT filenames."""
@@ -184,7 +165,7 @@ def _write_txt_and_manifest(
 ) -> Path:
     """
     Write text into OCR_DIR as a .txt file and append a manifest entry.
-    Returns the txt_path.
+    Returns the txt_path. Indexing is handled by the caller.
     """
     OCR_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -239,77 +220,134 @@ def _extract_csv_text(text: str) -> str:
     return "\n".join(out_lines)
 
 
+# ---------- Non-hanging web ingest (used by background worker) ----------
+
 def ingest_url_web(url: str, case: str | None):
     """
-    Ingest an arbitrary URL:
+    Ingest a URL for the web UI / background worker with short, safe networking:
 
-      - If it's a PDF -> delegate to ingest_source (existing pipeline).
-      - If it's DOCX -> extract text via python-docx -> web_docx.
-      - If it's CSV -> flatten rows -> web_csv.
-      - If it's HTML -> strip to text and record as web_html.
-      - If it's text/* -> record as web_text.
+      - SINGLE GET request (no HEAD)
+      - Short timeout so multiple URLs don't hang the worker
+      - Same behaviors for PDF/HTML/text/CSV/DOCX
 
     Returns (pdf_path, txt_path) where pdf_path may be None.
+    Raises ValueError on unsupported types.
     """
+
+    _log_debug(f"ingest_url_web: START url={url!r}, case={case!r}")
+
     headers = {
-        "User-Agent": "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)",
+        "User-Agent": (
+            "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)"
+        ),
+        "Accept": "*/*",
     }
 
-    # Try HEAD first to inspect content-type
+    # Single GET with short timeout
     try:
-        head_resp = requests.head(
+        resp = requests.get(
             url,
             headers=headers,
-            timeout=15,
+            timeout=(5, 10),  # (connect_timeout, read_timeout)
             allow_redirects=True,
         )
-        ctype = (head_resp.headers.get("Content-Type") or "").lower()
-    except Exception:
-        head_resp = None
-        ctype = ""
-
-    # PDF: existing pipeline
-    if "pdf" in ctype or url.lower().endswith(".pdf"):
-        pdf_path, txt_path = ingest_source(url, case=case)
-        return pdf_path, txt_path
-
-    # Fetch body for everything else
-    resp = requests.get(url, headers=headers, timeout=30)
-    resp.raise_for_status()
-    if not ctype:
+        resp.raise_for_status()
         ctype = (resp.headers.get("Content-Type") or "").lower()
+        _log_debug(
+            f"ingest_url_web: GET ok url={url}, status={resp.status_code}, ctype={ctype}"
+        )
+    except Exception as e:
+        _log_debug(f"ingest_url_web: GET FAILED url={url}: {e!r}")
+        raise RuntimeError(f"Network error fetching {url}: {e}")
+
+    # PDF: existing pipeline does everything (download, OCR, index)
+    if "pdf" in ctype or url.lower().endswith(".pdf"):
+        try:
+            _log_debug(
+                f"ingest_url_web: PDF detected, delegating to ingest_source: {url}"
+            )
+            pdf_path, txt_path = ingest_source(url, case=case)
+            return pdf_path, txt_path
+        except Exception as e:
+            _log_debug(f"ingest_url_web: ingest_source FAILED for {url}: {e!r}")
+            raise
 
     # DOCX
     if (
         "officedocument.wordprocessingml.document" in ctype
         or url.lower().endswith(".docx")
     ):
-        text = _extract_docx_text(resp.content)
-        txt_path = _write_txt_and_manifest(text, url, case, kind="web_docx")
-        return None, txt_path
+        try:
+            _log_debug("ingest_url_web: DOCX detected")
+            text = _extract_docx_text(resp.content)
+            txt_path = _write_txt_and_manifest(text, url, case, kind="web_docx")
+            try:
+                index_txt_document(str(txt_path))
+            except Exception as e:
+                _log_debug(
+                    f"ingest_url_web: DOCX index_txt_document FAILED for {txt_path}: {e!r}"
+                )
+            return None, txt_path
+        except Exception as e:
+            _log_debug(f"ingest_url_web: DOCX extract FAILED for {url}: {e!r}")
+            raise
 
     # CSV
     if "text/csv" in ctype or url.lower().endswith(".csv"):
-        raw_text = resp.text
-        text = _extract_csv_text(raw_text)
-        txt_path = _write_txt_and_manifest(text, url, case, kind="web_csv")
-        return None, txt_path
+        try:
+            _log_debug("ingest_url_web: CSV detected")
+            raw_text = resp.text
+            text = _extract_csv_text(raw_text)
+            txt_path = _write_txt_and_manifest(text, url, case, kind="web_csv")
+            try:
+                index_txt_document(str(txt_path))
+            except Exception as e:
+                _log_debug(
+                    f"ingest_url_web: CSV index_txt_document FAILED for {txt_path}: {e!r}"
+                )
+            return None, txt_path
+        except Exception as e:
+            _log_debug(f"ingest_url_web: CSV extract FAILED for {url}: {e!r}")
+            raise
 
     # HTML
     if "html" in ctype or url.lower().endswith((".htm", ".html", "/")):
-        soup = BeautifulSoup(resp.text, "html.parser")
-        text = soup.get_text("\n", strip=True)
-        txt_path = _write_txt_and_manifest(text, url, case, kind="web_html")
-        return None, txt_path
+        try:
+            _log_debug("ingest_url_web: HTML detected")
+            soup = BeautifulSoup(resp.text, "html.parser")
+            text = soup.get_text("\n", strip=True)
+            txt_path = _write_txt_and_manifest(text, url, case, kind="web_html")
+            try:
+                index_txt_document(str(txt_path))
+            except Exception as e:
+                _log_debug(
+                    f"ingest_url_web: HTML index_txt_document FAILED for {txt_path}: {e!r}"
+                )
+            return None, txt_path
+        except Exception as e:
+            _log_debug(f"ingest_url_web: HTML parse FAILED for {url}: {e!r}")
+            raise
 
     # Generic text/*
     if ctype.startswith("text/"):
-        text = resp.text
-        txt_path = _write_txt_and_manifest(text, url, case, kind="web_text")
-        return None, txt_path
+        try:
+            _log_debug("ingest_url_web: text/* detected")
+            text = resp.text
+            txt_path = _write_txt_and_manifest(text, url, case, kind="web_text")
+            try:
+                index_txt_document(str(txt_path))
+            except Exception as e:
+                _log_debug(
+                    f"ingest_url_web: TEXT index_txt_document FAILED for {txt_path}: {e!r}"
+                )
+            return None, txt_path
+        except Exception as e:
+            _log_debug(f"ingest_url_web: TEXT ingest FAILED for {url}: {e!r}")
+            raise
 
     # Fallback
-    raise ValueError(f"Unsupported content type for web ingest: {ctype or 'unknown'}")
+    _log_debug(f"ingest_url_web: UNSUPPORTED CONTENT TYPE {ctype!r}")
+    raise ValueError(f"Unsupported content type for ingest: {ctype or 'unknown'}")
 
 
 # ---------- Base Styles ----------
@@ -400,7 +438,8 @@ BASE_STYLE = """
   }
 
   code, pre {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", "Courier New", monospace;
+    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
+      "Liberation Mono", "Courier New", monospace;
     font-size: 0.9rem;
   }
 
@@ -429,6 +468,7 @@ BASE_STYLE = """
 </style>
 """
 
+
 # ---------- Templates ----------
 
 INDEX_TEMPLATE = """
@@ -441,6 +481,7 @@ INDEX_TEMPLATE = """
 <nav>
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
+  <a href="/recent">Recent</a>
   <a href="/web-ingest">Web Ingest</a>
 </nav>
 
@@ -505,6 +546,7 @@ CASES_TEMPLATE = """
 <nav>
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
+  <a href="/recent">Recent</a>
   <a href="/web-ingest">Web Ingest</a>
 </nav>
 
@@ -546,6 +588,7 @@ CASE_TEMPLATE = """
 <nav>
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
+  <a href="/recent">Recent</a>
   <a href="/web-ingest">Web Ingest</a>
 </nav>
 
@@ -578,6 +621,54 @@ CASE_TEMPLATE = """
 </body></html>
 """
 
+RECENT_TEMPLATE = """
+<!doctype html>
+<html><head>
+<meta charset="utf-8"><title>Straightline Vault — Recent Docs</title>
+{{ style|safe }}
+</head>
+<body>
+<nav>
+  <a href="/">Search</a>
+  <a href="/cases">Cases</a>
+  <a href="/recent">Recent</a>
+  <a href="/web-ingest">Web Ingest</a>
+</nav>
+
+<h1>Recent Documents</h1>
+<p class="meta">
+  Most recent ingested documents, ordered by manifest timestamp (newest first).
+</p>
+
+{% if not docs %}
+  <p>No documents found in manifest.</p>
+{% else %}
+  <table>
+    <thead>
+      <tr>
+        <th>Timestamp (UTC)</th>
+        <th>Doc ID</th>
+        <th>Case</th>
+        <th>Kind</th>
+        <th>Source URL</th>
+      </tr>
+    </thead>
+    <tbody>
+      {% for d in docs %}
+        <tr>
+          <td><code>{{ d.timestamp }}</code></td>
+          <td><a href="/doc/{{ d.doc_id }}">{{ d.doc_id }}</a></td>
+          <td>{{ d.case or "" }}</td>
+          <td>{{ d.kind or "" }}</td>
+          <td>{% if d.source_url %}<code>{{ d.source_url }}</code>{% endif %}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
+{% endif %}
+</body></html>
+"""
+
 DOC_TEMPLATE = """
 <!doctype html>
 <html><head>
@@ -589,9 +680,7 @@ DOC_TEMPLATE = """
 <nav>
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
-  {% if case_name %}
-    <a href="/case/{{ case_name }}">Back to case</a>
-  {% endif %}
+  <a href="/recent">Recent</a>
   <a href="/web-ingest">Web Ingest</a>
 </nav>
 
@@ -623,6 +712,7 @@ WEB_INGEST_TEMPLATE = """
 <nav>
   <a href="/">Search</a>
   <a href="/cases">Cases</a>
+  <a href="/recent">Recent</a>
   <a href="/web-ingest">Web Ingest</a>
 </nav>
 
@@ -672,18 +762,34 @@ WEB_INGEST_TEMPLATE = """
       {% if item.error %}
         <div class="error"><strong>Error:</strong> {{ item.error }}</div>
       {% else %}
-        {% if item.pdf_path %}
-          <div>PDF: <code>{{ item.pdf_path }}</code></div>
-        {% endif %}
-        {% if item.txt_path %}
-          <div>TXT: <code>{{ item.txt_path }}</code></div>
-        {% endif %}
-        {% if not item.pdf_path and not item.txt_path %}
-          <div class="meta">No paths recorded (unexpected).</div>
+        {% if item.job_path %}
+          <div>Job file: <code>{{ item.job_path }}</code></div>
+        {% else %}
+          <div class="meta">Queued (no job_path recorded).</div>
         {% endif %}
       {% endif %}
     </div>
   {% endfor %}
+{% endif %}
+
+{% if queue_jobs %}
+  <h2>Pending Jobs</h2>
+  <p class="meta">{{ queue_jobs|length }} job(s) currently in queue.</p>
+  <table>
+    <thead>
+      <tr><th>Job file</th><th>Case</th><th>URL</th><th>Queued at (UTC)</th></tr>
+    </thead>
+    <tbody>
+      {% for j in queue_jobs %}
+        <tr>
+          <td><code>{{ j.name }}</code></td>
+          <td>{{ j.case or "" }}</td>
+          <td><code>{{ j.url or "" }}</code></td>
+          <td>{{ j.queued_at }}</td>
+        </tr>
+      {% endfor %}
+    </tbody>
+  </table>
 {% endif %}
 
 </body></html>
@@ -700,8 +806,16 @@ def build_case_stats():
         stats[case]["total"] += 1
         stats[case]["kinds"][kind] += 1
     return sorted(
-        ((name, {"total": info["total"], "kinds": dict(info["kinds"])})
-         for name, info in stats.items()),
+        (
+            (
+                name,
+                {
+                    "total": info["total"],
+                    "kinds": dict(info["kinds"]),
+                },
+            )
+            for name, info in stats.items()
+        ),
         key=lambda x: x[0],
     )
 
@@ -729,6 +843,71 @@ def load_ocr_text(path_str: str):
         return None, str(e)
 
 
+def build_manifest_index():
+    """
+    Build a mapping of doc_id -> manifest record.
+    doc_id is derived from the stem of the TXT path.
+    """
+    index: dict[str, dict] = {}
+    for rec in iter_manifest() or []:
+        txt = rec.get("txt")
+        if not txt:
+            continue
+        p = Path(txt)
+        doc_id = p.stem
+        index[doc_id] = rec
+    return index
+
+
+def iter_recent_docs(limit: int = 50):
+    """
+    Return a list of the most recent manifest entries, newest first.
+
+    Each item:
+      {
+        "doc_id": str,
+        "timestamp": str,
+        "case": Optional[str],
+        "kind": Optional[str],
+        "source_url": Optional[str],
+      }
+    """
+    records = list(iter_manifest() or [])
+
+    def _parse_ts(rec):
+        ts = rec.get("timestamp")
+        if not ts:
+            return datetime.min
+        try:
+            # Handles normal isoformat, including fractions
+            return datetime.fromisoformat(ts)
+        except Exception:
+            return datetime.min
+
+    # Sort newest first
+    records.sort(key=_parse_ts, reverse=True)
+
+    docs = []
+    for rec in records[:limit]:
+        txt = rec.get("txt")
+        if not txt:
+            continue
+        p = Path(txt)
+        doc_id = p.stem
+
+        docs.append(
+            {
+                "doc_id": doc_id,
+                "timestamp": rec.get("timestamp") or "",
+                "case": rec.get("case"),
+                "kind": rec.get("kind"),
+                "source_url": rec.get("source_url"),
+            }
+        )
+
+    return docs
+
+
 # ---------- Routes ----------
 
 @app.route("/", methods=["GET"])
@@ -743,7 +922,43 @@ def index():
     except ValueError:
         limit = 20
 
-    results = run_search(q, case=case, kind=kind, limit=limit) if q else []
+    raw_results = run_search(q, case=case, kind=kind, limit=limit) if q else []
+
+    # Build an index of doc_id -> manifest record so we can attach metadata
+    manifest_index = build_manifest_index()
+
+    enriched_results = []
+    for r in raw_results:
+        # Support both attribute-style and dict-style results, just in case
+        doc_id = getattr(r, "doc_id", None) or getattr(r, "id", None)
+        if doc_id is None and isinstance(r, dict):
+            doc_id = r.get("doc_id") or r.get("id")
+
+        score = getattr(r, "score", None)
+        snippet = getattr(r, "snippet", None)
+        source = getattr(r, "source", None)
+
+        if isinstance(r, dict):
+            score = score if score is not None else r.get("score")
+            snippet = snippet if snippet is not None else r.get("snippet")
+            source = source if source is not None else r.get("source")
+
+        rec = manifest_index.get(doc_id, {}) if doc_id else {}
+
+        enriched_results.append(
+            {
+                "doc_id": doc_id,
+                "score": score,
+                "snippet": snippet,
+                # Prefer search backend's source, fall back to manifest source_url/txt/pdf
+                "source": source
+                or rec.get("source_url")
+                or rec.get("txt")
+                or rec.get("pdf"),
+                "case": rec.get("case"),
+                "kind": rec.get("kind"),
+            }
+        )
 
     return render_template_string(
         INDEX_TEMPLATE,
@@ -752,7 +967,7 @@ def index():
         case=case or "",
         kind=kind or "",
         limit=limit,
-        results=results,
+        results=enriched_results,
     )
 
 
@@ -762,6 +977,16 @@ def cases_view():
         CASES_TEMPLATE,
         style=BASE_STYLE,
         cases=build_case_stats(),
+    )
+
+
+@app.route("/recent", methods=["GET"])
+def recent_view():
+    docs = iter_recent_docs(limit=50)
+    return render_template_string(
+        RECENT_TEMPLATE,
+        style=BASE_STYLE,
+        docs=docs,
     )
 
 
@@ -827,7 +1052,7 @@ def web_ingest():
     """
     query = ""
     case = ""
-    limit = 5
+    limit = 10
     error: str | None = None
     pdf_urls: list[str] = []
     ingested: list[dict] = []
@@ -837,11 +1062,17 @@ def web_ingest():
         case = (request.form.get("case") or "").strip()
         limit_raw = (request.form.get("limit") or "").strip()
 
+        # parse + clamp limit so a typo doesn't wreck the worker
         try:
-            limit = int(limit_raw) if limit_raw else 5
+            limit = int(limit_raw) if limit_raw else 10
         except ValueError:
             error = "Limit must be an integer."
-            limit = 5
+            limit = 10
+
+        if limit < 1:
+            limit = 1
+        if limit > 20:
+            limit = 20
 
         if not error:
             if not query:
@@ -863,12 +1094,11 @@ def web_ingest():
                 if not error:
                     for url in pdf_urls:
                         try:
-                            pdf_path, txt_path = ingest_url_web(url, case=case)
+                            job_path = enqueue_ingest_job(url, case=case or None)
                             ingested.append(
                                 {
                                     "url": url,
-                                    "pdf_path": str(pdf_path) if pdf_path else None,
-                                    "txt_path": str(txt_path) if txt_path else None,
+                                    "job_path": str(job_path),
                                     "error": None,
                                 }
                             )
@@ -876,11 +1106,61 @@ def web_ingest():
                             ingested.append(
                                 {
                                     "url": url,
-                                    "pdf_path": None,
-                                    "txt_path": None,
+                                    "job_path": None,
                                     "error": str(e),
                                 }
                             )
+
+    # --- Always show current queue state, even on GET ---
+
+    queue_jobs: list[dict] = []
+    try:
+        if JOBS_QUEUE_DIR.exists():
+            for p in sorted(JOBS_QUEUE_DIR.glob("*.json")):
+                # filename pattern: {ts}-{pid}-{safe_case}.json
+                name = p.name
+                ts_ms = None
+                case_from_name: str | None = None
+
+                parts = name.split("-", 2)
+                if len(parts) >= 2:
+                    # first part is timestamp in ms
+                    try:
+                        ts_ms = int(parts[0])
+                    except ValueError:
+                        ts_ms = None
+                    if len(parts) == 3:
+                        # third part includes safe_case plus ".json"
+                        case_from_name = parts[2].rsplit(".", 1)[0]
+
+                queued_at = ""
+                if ts_ms is not None:
+                    try:
+                        queued_at = datetime.utcfromtimestamp(ts_ms / 1000.0).isoformat()
+                    except Exception:
+                        queued_at = ""
+
+                # also try to read payload for url/case
+                url = ""
+                case_field: str | None = None
+                try:
+                    payload = json.loads(p.read_text(encoding="utf-8"))
+                    url = str(payload.get("url") or "")
+                    case_field = payload.get("case")
+                except Exception:
+                    pass
+
+                queue_jobs.append(
+                    {
+                        "name": name,
+                        "url": url,
+                        "case": case_field or case_from_name,
+                        "queued_at": queued_at,
+                    }
+                )
+    except Exception as e:
+        _log_debug(f"web_ingest: failed to list queue jobs: {e!r}")
+        queue_jobs = []
 
     return render_template_string(
         WEB_INGEST_TEMPLATE,
@@ -891,9 +1171,5 @@ def web_ingest():
         error=error,
         pdf_urls=pdf_urls,
         ingested=ingested,
+        queue_jobs=queue_jobs,
     )
-
-
-if __name__ == "__main__":
-    # Dev mode only; production should use gunicorn behind nginx.
-    app.run(host="127.0.0.1", port=5001, debug=True)
