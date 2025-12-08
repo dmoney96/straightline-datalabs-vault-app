@@ -617,26 +617,43 @@ def index():
         active_nav="search",
     )
 
-
 @app.route("/web-ingest", methods=["GET", "POST"])
 def web_ingest():
     """
-    Web-ingest is available to *any* nginx-authenticated user.
-    Nginx basic auth is the real gate; Flask does not ask for another login.
+    Web-ingest via QUERY-FIRST metasearch.
+
+    - User provides a query (required).
+    - Optional: case + limit.
+    - We run metasearch(query, max_results=limit) to get full web hits:
+        title, url, snippet, engine.
+    - We derive "document-like" URLs (pdf, docx, html, csv, text) and
+      enqueue ingest jobs for those.
+    - Page shows:
+        * the raw metasearch results (title + snippet + URL)
+        * which results were queued for ingest
+        * current contents of the jobs/queue directory.
     """
+    active_nav = "web_ingest"
+
     query: str = ""
     case: str = ""
     limit: int = 10
     error: str | None = None
-    pdf_urls: list[str] = []
+
+    # Full metasearch results for display
+    search_results: list[dict] = []
+
+    # Jobs we just enqueued this request (keyed by URL)
     ingested: list[dict] = []
+    ingested_by_url: dict[str, dict] = {}
 
     if request.method == "POST":
-        query = (request.form.get("q") or "").strip()
+        # NOTE: we read "query" to match the template form name
+        query = (request.form.get("query") or "").strip()
         case = (request.form.get("case") or "").strip()
         limit_raw = (request.form.get("limit") or "").strip()
 
-        # parse + clamp limit so a typo doesn't wreck the worker
+        # Parse + clamp limit
         try:
             limit = int(limit_raw) if limit_raw else 10
         except ValueError:
@@ -652,38 +669,86 @@ def web_ingest():
             if not query:
                 error = "Query is required."
             else:
-                # Auto-generate case if blank
+                # Auto-generate case if blank, based on query
                 if not case:
                     slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
                     case = f"{slug}_web" if slug else "web"
 
+                # --- 1) Run metasearch to get full web hits ---
                 try:
-                    pdf_urls = fetch_doc_urls(query, limit=limit)
+                    raw_results = metasearch(query, max_results=limit)
+                except MetasearchError as e:
+                    current_app.logger.warning("web_ingest: metasearch unavailable: %r", e)
+                    error = f"Metasearch unavailable: {e}"
+                    raw_results = []
                 except Exception as e:
-                    error = f"Web search failed: {e}"
+                    current_app.logger.exception("web_ingest: metasearch error")
+                    error = f"Metasearch error: {e}"
+                    raw_results = []
 
-                if not error and not pdf_urls:
-                    error = "No document-like URLs found in search results."
+                # Adapt results to a uniform dict shape for the template
+                for r in raw_results:
+                    if isinstance(r, dict):
+                        title = r.get("title") or ""
+                        url = r.get("url") or ""
+                        snippet = r.get("snippet") or ""
+                        engine = r.get("engine") or ""
+                    else:
+                        title = getattr(r, "title", "") or ""
+                        url = getattr(r, "url", "") or ""
+                        snippet = getattr(r, "snippet", "") or ""
+                        engine = getattr(r, "engine", "") or ""
+
+                    if not url:
+                        continue
+
+                    search_results.append(
+                        {
+                            "title": title,
+                            "url": url,
+                            "snippet": snippet,
+                            "engine": engine,
+                        }
+                    )
+
+                # --- 2) From those hits, choose document-like URLs to ingest ---
+                if not error and not search_results:
+                    error = "No results returned from metasearch."
 
                 if not error:
-                    for url in pdf_urls:
+                    def looks_document_like(u: str) -> bool:
+                        u_lower = u.lower()
+                        if any(u_lower.endswith(ext) for ext in (".pdf", ".docx", ".csv", ".txt")):
+                            return True
+                        # Also treat typical 'document' pages as candidates
+                        if any(
+                            token in u_lower
+                            for token in ("docket", "courtlistener", "storage.googleapis.com", "govinfo.gov")
+                        ):
+                            return True
+                        return False
+
+                    for hit in search_results:
+                        url = hit["url"]
+                        if not looks_document_like(url):
+                            continue
+
                         try:
                             job_path = enqueue_ingest_job(url, case=case or None)
-                            ingested.append(
-                                {
-                                    "url": url,
-                                    "job_path": str(job_path),
-                                    "error": None,
-                                }
-                            )
+                            item = {
+                                "url": url,
+                                "job_path": str(job_path),
+                                "error": None,
+                            }
                         except Exception as e:
-                            ingested.append(
-                                {
-                                    "url": url,
-                                    "job_path": None,
-                                    "error": str(e),
-                                }
-                            )
+                            item = {
+                                "url": url,
+                                "job_path": None,
+                                "error": str(e),
+                            }
+
+                        ingested.append(item)
+                        ingested_by_url[url] = item
 
     # --- Always show current queue state, even on GET ---
     queue_jobs: list[dict] = []
@@ -739,16 +804,16 @@ def web_ingest():
 
     return render_template(
         "web_ingest.html",
+        active_nav=active_nav,
         query=query,
         case=case,
         limit=limit,
         error=error,
-        pdf_urls=pdf_urls,
+        search_results=search_results,
         ingested=ingested,
+        ingested_by_url=ingested_by_url,
         queue_jobs=queue_jobs,
-        active_nav="web_ingest",
     )
-
 
 @app.route("/cases", methods=["GET"])
 def cases_view():

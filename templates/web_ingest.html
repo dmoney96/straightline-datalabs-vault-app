@@ -3,12 +3,11 @@
 {% block title %}Ingest from web · Straightline Vault{% endblock %}
 
 {% block header_meta %}
-  Controlled ingest from the public web into your internal corpus.
+  Run a metasearch against the public web, inspect hits, and enqueue document-like URLs into the Vault.
 {% endblock %}
 
 {% block content %}
-
-<section class="card card--subtle">
+<section class="card">
 
   <h2
     style="
@@ -19,142 +18,189 @@
       color:#ffffcc;
     "
   >
-    Search the public web &amp; ingest into the Vault
+    Ingest from web
   </h2>
 
   <p class="meta">
-    Run a <strong>keyword query</strong> across your configured web search APIs and
-    pipe the result set straight into a tagged case inside the Straightline Vault.
-    No copy–pasting URLs required.
+    Start with a <strong>query</strong>. We hit Brave / SerpAPI / metasearch, show you
+    the results, and automatically enqueue document-like URLs (PDF, DOCX, CSV, TXT, or
+    docket-style pages) for background ingest.
   </p>
 
-  {# 👇 Main ingest form. We keep the action and field names stable. #}
-  <form method="post" action="/web-ingest" style="margin-top:0.9rem;">
+  <form method="post" style="margin-top:0.85rem;">
 
-    {# 🔍 QUERY – PRIMARY INPUT. This is what drives your metasearch layer. #}
     <div class="field-row">
       <label for="query">Query</label>
       <input
         id="query"
         name="query"
         type="text"
-        placeholder="e.g. jamal khashoggi cia report 2021 pdf"
+        required
         autocomplete="off"
-        value="{{ query or q or '' }}"
+        value="{{ query or '' }}"
+        placeholder="e.g. &quot;Maxwell 1320 docket pdf&quot; or &quot;Trump MRI abdomen pdf&quot;"
       >
     </div>
-    <p class="meta-soft" style="margin-top:-0.35rem; margin-bottom:0.75rem;">
-      This is the main control. The backend should use this to hit your metasearch
-      layer (SerpAPI / DDG / whatever) and enqueue matching pages for ingest.
-    </p>
 
-    {# 📂 CASE – same name as before so routing stays intact. #}
     <div class="field-row">
       <label for="case">Case</label>
       <input
         id="case"
         name="case"
         type="text"
-        placeholder="e.g. maxwell_1320"
-        value="{{ default_case or case or '' }}"
+        autocomplete="off"
+        value="{{ case or '' }}"
+        placeholder="Optional: vault case ID (e.g. epstein_1320_web)"
       >
     </div>
-    <p class="meta-soft" style="margin-top:-0.35rem; margin-bottom:0.75rem;">
-      Case / corpus bucket to attach these results to inside the Vault.
-    </p>
 
-    {# 🧬 KIND – same name, default web_html unless you override. #}
     <div class="field-row">
-      <label for="kind">Kind</label>
+      <label for="limit">Limit</label>
       <input
-        id="kind"
-        name="kind"
-        type="text"
-        placeholder="e.g. web_html, url_fetch"
-        value="{{ default_kind or kind or 'web_html' }}"
+        id="limit"
+        name="limit"
+        type="number"
+        min="1"
+        max="20"
+        value="{{ limit or 10 }}"
       >
     </div>
-    <p class="meta-soft" style="margin-top:-0.35rem; margin-bottom:0.75rem;">
-      Optional ingest kind for downstream filtering (web_html, url_fetch, etc).
-    </p>
 
-    {# 📝 NOTES – justification / context. #}
-    <div class="field-row" style="align-items:flex-start;">
-      <label for="notes" style="margin-top:0.2rem;">Notes</label>
-      <textarea
-        id="notes"
-        name="notes"
-        rows="3"
-        style="
-          width:100%;
-          resize:vertical;
-          border-radius:6px;
-          border:1px solid #111827;
-          background:#020617;
-          color:#e5e7eb;
-          padding:0.5rem 0.6rem;
-          font-size:0.9rem;
-        "
-        placeholder="Optional: short justification or context for why this query belongs in this case."
-      >{{ notes or '' }}</textarea>
-    </div>
-
-    {# 🌐 OPTIONAL DIRECT URL – tertiary, like you said. #}
-    <details style="margin-top:0.9rem;">
-      <summary class="meta-soft" style="cursor:pointer;">
-        Advanced: ingest a specific URL instead of (or in addition to) a query
-      </summary>
-
-      <div class="field-row" style="margin-top:0.65rem;">
-        <label for="url">URL</label>
-        <input
-          id="url"
-          name="url"
-          type="url"
-          placeholder="https://example.com/investigation-piece"
-          autocomplete="off"
-          value="{{ url or '' }}"
-        >
-      </div>
-      <p class="meta-soft" style="margin-top:-0.35rem; margin-bottom:0.25rem;">
-        Optional. Use only when you genuinely need one very specific page.
-      </p>
-    </details>
-
-    {# 🚀 SUBMIT BUTTON #}
-    <div style="margin-top:1.1rem; display:flex; justify-content:flex-start;">
-      <button
-        type="submit"
-        style="
-          border:none;
-          border-radius:999px;
-          padding:0.45rem 1.2rem;
-          font-size:0.9rem;
-          font-weight:500;
-          cursor:pointer;
-          background:linear-gradient(135deg,#2563eb,#4f46e5);
-          color:#e5e7eb;
-          box-shadow:0 10px 25px rgba(15,23,42,0.9);
-        "
-      >
-        Run web ingest
-      </button>
-    </div>
-
+    <button type="submit">
+      🔍 Search web &amp; enqueue
+    </button>
   </form>
+
+  {% if error %}
+    <p class="error" style="margin-top:0.75rem;">
+      {{ error }}
+    </p>
+  {% endif %}
 
 </section>
 
-{# 🔎 OPTIONAL: show backend status / summary if you set these in the view. #}
-{% if ingest_summary %}
-  <section class="card" style="margin-top:1rem;">
-    <div class="card-header">
-      <h3 style="margin:0; font-size:0.98rem;">Ingest summary</h3>
-    </div>
-    <p class="meta" style="margin-top:0.5rem;">
-      {{ ingest_summary }}
+{% if search_results %}
+<section class="card card--subtle" style="margin-top:1.25rem;">
+
+  <div class="card-header">
+    <h3 style="margin:0; font-size:0.98rem;">Metasearch results</h3>
+    <p class="meta-soft" style="margin:0;">
+      {{ search_results|length }} hit{{ search_results|length != 1 and "s" or "" }}
+      for <code>{{ query }}</code>{% if case %} &nbsp;·&nbsp; queued under case
+      <code>{{ case }}</code>{% endif %}.
     </p>
-  </section>
+  </div>
+
+  <div class="table-wrapper" style="margin-top:0.75rem;">
+    <table class="table--data">
+      <thead>
+        <tr>
+          <th style="width:35%;">Title</th>
+          <th style="width:35%;">Snippet</th>
+          <th style="width:30%;">URL / ingest status</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for r in search_results %}
+          {% set ingest = ingested_by_url.get(r.url) if ingested_by_url is defined else None %}
+          <tr>
+            <td>
+              {% if r.title %}
+                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
+                  {{ r.title }}
+                </a>
+              {% else %}
+                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
+                  {{ r.url }}
+                </a>
+              {% endif %}
+              {% if r.engine %}
+                <div class="meta-soft" style="margin-top:0.2rem;">
+                  Source: {{ r.engine }}
+                </div>
+              {% endif %}
+            </td>
+            <td>
+              {% if r.snippet %}
+                <div class="meta-soft">
+                  {{ r.snippet }}
+                </div>
+              {% else %}
+                <span class="meta-soft">No snippet provided.</span>
+              {% endif %}
+            </td>
+            <td class="url-cell">
+              <code>{{ r.url }}</code>
+              <div style="margin-top:0.25rem;">
+                {% if ingest %}
+                  {% if ingest.error %}
+                    <span class="error">
+                      Ingest error: {{ ingest.error }}
+                    </span>
+                  {% else %}
+                    <span class="meta-soft">
+                      Enqueued → <code>{{ ingest.job_path }}</code>
+                    </span>
+                  {% endif %}
+                {% else %}
+                  <span class="meta-soft">
+                    Not enqueued (URL didn't match document-like heuristics).
+                  </span>
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</section>
+{% endif %}
+
+{% if queue_jobs %}
+<section class="card card--subtle" style="margin-top:1.25rem;">
+
+  <div class="card-header">
+    <h3 style="margin:0; font-size:0.98rem;">Current ingest queue</h3>
+    <p class="meta-soft" style="margin:0;">
+      {{ queue_jobs|length }} job{{ queue_jobs|length != 1 and "s" or "" }} waiting in
+      <code>jobs/queue</code>.
+    </p>
+  </div>
+
+  <div class="table-wrapper" style="margin-top:0.75rem;">
+    <table class="table--data">
+      <thead>
+        <tr>
+          <th style="width:25%;">Queued at (UTC)</th>
+          <th style="width:20%;">Case</th>
+          <th style="width:55%;">URL / job file</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for job in queue_jobs %}
+          <tr>
+            <td>
+              <code>{{ job.queued_at or "" }}</code>
+            </td>
+            <td>
+              {{ job.case or "" }}
+            </td>
+            <td class="url-cell">
+              {% if job.url %}
+                <code>{{ job.url }}</code>
+              {% else %}
+                <code>{{ job.name }}</code>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+</section>
 {% endif %}
 
 {% endblock %}
