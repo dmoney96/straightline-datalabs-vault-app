@@ -1,58 +1,30 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python
+from __future__ import annotations
+
 """
 WSGI entrypoint for Straightline Vault.
 
-This file is intentionally minimal: it just locates the project
-root, ensures the correct paths are on sys.path, and imports
-the Flask app instance from scripts/web_app.py as `application`.
+Gunicorn runs:  wsgi:application
 """
 
-import os
 import sys
 from pathlib import Path
 
-# -----------------------------------------------------------
-# 1. Locate project root and app directory
-# -----------------------------------------------------------
-
+# Project root, e.g. /home/dom/vault-app
 ROOT = Path(__file__).resolve().parent
-APP_DIR = ROOT / "scripts"
-
-# Ensure project root and /scripts are on the Python path
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
-if str(APP_DIR) not in sys.path:
-    sys.path.insert(0, str(APP_DIR))
 
-# Optional: basic startup logging to stderr (shows in journalctl)
-def _wsgi_log(msg: str) -> None:
-    try:
-        print(f"[WSGI] {msg}", file=sys.stderr, flush=True)
-    except Exception:
-        # Don't let logging issues break the app
-        pass
+# Also add scripts/ so we can import scripts.web_app
+SCRIPTS_DIR = ROOT / "scripts"
+if SCRIPTS_DIR.is_dir() and str(SCRIPTS_DIR) not in sys.path:
+    sys.path.insert(0, str(SCRIPTS_DIR))
 
-_wsgi_log(f"Python executable: {sys.executable}")
-_wsgi_log(f"Project root: {ROOT}")
-_wsgi_log(f"App dir: {APP_DIR}")
-_wsgi_log("Attempting to load Straightline Vault Flask app…")
+# Debug breadcrumbs – these will show up in journalctl when Gunicorn imports wsgi
+print("WSGI ROOT:", ROOT)
+print("WSGI SCRIPTS_DIR:", SCRIPTS_DIR)
+print("WSGI scripts/web_app.py exists?:", (SCRIPTS_DIR / "web_app.py").exists())
+print("WSGI sys.path[0:5]:", sys.path[0:5])
 
-# -----------------------------------------------------------
-# 2. Import the actual Flask app
-#    (defined as `app` in scripts/web_app.py)
-# -----------------------------------------------------------
-
-try:
-    from web_app import app  # scripts/web_app.py must define `app = Flask(__name__)`
-except Exception as e:
-    _wsgi_log(f"FAILED TO LOAD APP: {e!r}")
-    # Re-raise so Gunicorn/uWSGI fails fast and logs the traceback
-    raise
-
-# -----------------------------------------------------------
-# 3. Expose WSGI callable for Gunicorn/uWSGI
-# -----------------------------------------------------------
-
-application = app
-
-_wsgi_log("Straightline Vault app loaded successfully.")
+# Import the Flask app object from scripts/web_app.py
+from scripts.web_app import app as application  # type: ignore[import]

@@ -1,0 +1,108 @@
+{% extends "base.html" %}
+
+{% block title %}Cases / Corpora · Straightline Vault{% endblock %}
+
+{% block header_meta %}
+  High-level overview of your ingested corpora and their document counts.
+{% endblock %}
+
+{% block content %}
+
+<section class="card">
+
+  <!-- Header -->
+  <h2
+    style="
+      display:flex;
+      align-items:center;
+      gap:0.45rem;
+      color:#ffffcc;
+      font-size:1.05rem;
+      font-weight:600;
+      margin:0 0 0.35rem 0;
+    "
+  >
+    <span style="display:inline-flex; align-items:center;">
+      📂
+    </span>
+    <span>Cases &amp; Corpora in the Straightline Vault</span>
+  </h2>
+
+  <p class="meta-soft" style="margin-top:0.1rem; opacity:0.9;">
+    Each case represents a focused corpus: a cluster of related documents, URLs,
+    and evidence tied to a specific thread of investigation.
+  </p>
+
+  <p class="meta" style="margin-top:0.75rem;">
+    Use this view to orient yourself before searching:
+    which cases are heavy, which are sparse, and what ingest kinds are present.
+  </p>
+
+</section>
+
+<section class="card card--subtle">
+
+  {% if cases and cases|length > 0 %}
+    <h3 style="margin-top:0; margin-bottom:0.75rem; font-size:0.98rem;">
+      Current cases ({{ cases|length }})
+    </h3>
+
+    <table>
+      <thead>
+        <tr>
+          <th style="width:30%;">Case ID</th>
+          <th style="width:20%;">Documents</th>
+          <th style="width:40%;">Ingest kinds</th>
+          <th style="width:10%;">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for c in cases %}
+        <tr>
+          <td>
+            <span class="pill-badge pill-badge--case">
+              {{ c.name }}
+            </span>
+          </td>
+          <td>
+            <span class="meta">
+              {{ c.doc_count or 0 }} doc{{ (c.doc_count or 0) != 1 and "s" or "" }}
+            </span>
+          </td>
+          <td>
+            {% if c.kinds %}
+              <span class="meta-soft">
+                {% if c.kinds is iterable and c.kinds is not string %}
+                  {{ c.kinds|join(", ") }}
+                {% else %}
+                  {{ c.kinds }}
+                {% endif %}
+              </span>
+            {% else %}
+              <span class="meta-soft">—</span>
+            {% endif %}
+          </td>
+          <td>
+            <a
+              href="/?case={{ c.name | urlencode }}"
+              class="meta"
+              style="font-size:0.85rem;"
+            >
+              View in search ↗
+            </a>
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+
+  {% else %}
+    <p class="meta-soft">
+      No cases found yet. Once you ingest local files or web content with a
+      <code>case</code> value, they’ll appear here.
+    </p>
+  {% endif %}
+
+</section>
+
+{% endblock %}

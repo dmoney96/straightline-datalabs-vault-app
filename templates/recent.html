@@ -1,0 +1,81 @@
+{% extends "base.html" %}
+
+{% block title %}Recent Documents · Straightline Vault{% endblock %}
+
+{% block header_meta %}
+  Most recently ingested documents in the Straightline Vault corpus.
+{% endblock %}
+
+{% block content %}
+<section class="card">
+
+  <h2
+    style="
+      margin-top:0;
+      margin-bottom:0.4rem;
+      font-size:1.05rem;
+      font-weight:600;
+      color:#ffffcc;
+    "
+  >
+    Recent Documents
+  </h2>
+
+  <p class="meta">
+    Showing the most recent ingested documents, ordered by manifest timestamp (newest first).
+  </p>
+
+  {% if not docs %}
+    <p class="meta">
+      No documents found in the manifest yet. Once ingest jobs complete and OCR finishes,
+      new documents will appear here.
+    </p>
+  {% else %}
+    <div class="table-wrapper" style="margin-top:0.85rem;">
+      <table class="table--data">
+        <thead>
+          <tr>
+            <th style="width:18%;">Timestamp (UTC)</th>
+            <th style="width:26%;">Doc ID</th>
+            <th style="width:14%;">Case</th>
+            <th style="width:10%;">Kind</th>
+            <th style="width:32%;">Source URL</th>
+          </tr>
+        </thead>
+
+        <tbody>
+          {% for d in docs %}
+            <tr>
+              <!-- Timestamp -->
+              <td>
+                <code>{{ d.timestamp }}</code>
+              </td>
+
+              <!-- Doc ID -->
+              <td class="docid-cell">
+                <a href="/doc/{{ d.doc_id }}">
+                  <code>{{ d.doc_id }}</code>
+                </a>
+              </td>
+
+              <!-- Case -->
+              <td>{{ d.case or "" }}</td>
+
+              <!-- Kind -->
+              <td>{{ d.kind or "" }}</td>
+
+              <!-- Source URL -->
+              <td class="url-cell">
+                {% if d.source_url %}
+                  <code>{{ d.source_url }}</code>
+                {% endif %}
+              </td>
+            </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  {% endif %}
+
+</section>
+{% endblock %}

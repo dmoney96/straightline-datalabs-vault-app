@@ -1,76 +1,135 @@
 #!/usr/bin/env python
+
 from __future__ import annotations
-from flask import current_app
-from datetime import datetime
-from collections import defaultdict
-from pathlib import Path
-from urllib.parse import urlparse
+
+# --- Standard library imports ---
+import os
 import sys
 import re
 import io
 import csv
-import os
 import json
 import time
+import logging
+from datetime import datetime, timezone
+from pathlib import Path
+from collections import defaultdict
+from urllib.parse import urlparse
 
+# --- Third-party imports ---
 import requests
 from bs4 import BeautifulSoup
 from flask import (
     Flask,
     request,
-    render_template_string,
+    render_template,
     abort,
+    current_app,
 )
 
-# Optional DOCX support
+# Optional DOCX parsing
 try:
     from docx import Document  # type: ignore[import]
-except ImportError:  # pragma: no cover
+except ImportError:
     Document = None
 
-# Ensure project root is on sys.path BEFORE importing vault_core
+# --- Ensure project root is importable ---
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
-from vault_core.search_backend import run_search, index_txt_document  # type: ignore[import]
-from vault_core.manifest import iter_manifest, append_manifest_entry  # type: ignore[import]
-from vault_core.ingest.pipeline import ingest_source  # type: ignore[import]
-from vault_core.paths import DATA_DIR, OCR_DIR  # type: ignore[import]
+# --- Flask app setup (single app instance) ---
+app = Flask(__name__, template_folder=str(ROOT / "templates"))
+app.secret_key = os.getenv("STRAIGHTLINE_SECRET_KEY", "dev-not-secret")
+
+# --- Internal Straightline Vault imports ---
+
+# External web search providers
 from vault_core.search_providers import (
     metasearch,
-    MetasearchError,  # uses Brave / Google CSE / Serp
-)  # type: ignore[import]
+    MetasearchError,
+    _serpapi_search,
+    _brave_search,
+)
 
-import os
-import logging
+# Manifest helpers
+from vault_core.manifest import (
+    DATA_DIR,
+    iter_manifest,
+    append_manifest_entry,
+)
 
-# DEBUG: show what env key Gunicorn actually sees
+# Search backend (Whoosh index)
+from vault_core.search.indexer import (
+    run_search,
+    update_index_for_file,
+)
+
+# Fallback OCR directory (manifest doesn't define OCR_DIR constant)
+OCR_DIR = DATA_DIR / "ocr"
+
+
+def index_txt_document(txt_path: str | Path) -> None:
+    """
+    Minimal wrapper around the Whoosh indexer so web_app doesn't
+    assume anything about higher-level ingest code.
+    """
+    update_index_for_file(Path(txt_path))
+
+
+def ingest_source(url: str, case: str | None = None):
+    """
+    Placeholder hook for PDF ingest.
+
+    This function is called by ingest_url_web() for PDF URLs.
+    It is intentionally *not* implemented here so we don't guess
+    about your existing ingest pipeline layout.
+
+    Wire this up to your real ingest function (wherever it lives)
+    or replace this stub with an implementation that:
+      - downloads the PDF,
+      - stores it under your data tree,
+      - OCRs it into TXT,
+      - appends a manifest entry,
+      - updates the index.
+
+    Expected return shape:
+        (pdf_path: Path | None, txt_path: Path | None)
+    """
+    raise NotImplementedError(
+        "ingest_source(url, case) is not implemented in scripts/web_app.py. "
+        "Wire this to your existing ingest pipeline."
+    )
+
+
+# --- Debug: confirm search API keys at boot ---
 logging.warning(
-    "DEBUG: Boot env SERPAPI_API_KEY startswith=%r",
+    "DEBUG: Boot env SERPAPI_API_KEY=%r BRAVE_API_KEY=%r BRAVE_SUBSCRIPTION_TOKEN=%r",
     os.getenv("SERPAPI_API_KEY", "")[:8],
+    os.getenv("BRAVE_API_KEY", "")[:8],
+    os.getenv("BRAVE_SUBSCRIPTION_TOKEN", "")[:8],
 )
 
 # -------------------------------
-# Flask app setup
+# Job queue paths
 # -------------------------------
 
-app = Flask(__name__)
-app.secret_key = os.getenv("STRAIGHTLINE_SECRET_KEY", "dev-not-secret")
-
-# ---------- Job queue paths ----------
 JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
 JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
 
 
-# ---------- Debug helper ----------
+# -------------------------------
+# Debug helper
+# -------------------------------
 
 def _log_debug(msg: str) -> None:
     """Simple stderr logger so messages show up in journalctl."""
     print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
 
 
-# ---------- Job queue writer ----------
+# -------------------------------
+# Job queue writer
+# -------------------------------
 
 def enqueue_ingest_job(url: str, case: str | None) -> Path:
     """
@@ -89,65 +148,87 @@ def enqueue_ingest_job(url: str, case: str | None) -> Path:
     _log_debug(f"enqueue_ingest_job: queued {url!r} case={case!r} -> {job_path}")
     return job_path
 
-# ---------- Web search helpers (metasearch + Brave fallback) ----------
 
-from vault_core.search_providers import (
-    metasearch,
-    MetasearchError,
-    _serpapi_search,  # make sure this import exists at the top
-)
+# -------------------------------
+# Web search helpers (Brave → SerpAPI → metasearch)
+# -------------------------------
 
 def fetch_doc_urls(query: str, limit: int = 10) -> list[str]:
     """
     Fetch document URLs for a query.
 
-    First try SerpAPI directly (we know this works),
-    then optionally fall back to metasearch if needed.
+    Priority:
+      1) Brave Web Search (BRAVE_API_KEY / BRAVE_SUBSCRIPTION_TOKEN)
+      2) SerpAPI (SERPAPI_API_KEY)
+      3) metasearch() as a last-ditch fallback
+
+    Returns a list of unique URLs, up to `limit`.
     """
     urls: list[str] = []
     limit = max(1, min(limit, 20))
 
-    # 1) Try SerpAPI directly
-    current_app.logger.warning(
-        "WEBDEBUG: fetch_doc_urls (serpapi-first): query=%r, limit=%r", query, limit
-    )
+    log = current_app.logger
+    log.warning("WEBDEBUG: fetch_doc_urls: query=%r, limit=%r", query, limit)
+
+    # --- 1) Brave first ---
     try:
-        serp_results = _serpapi_search(query, max_results=limit)
-        current_app.logger.warning(
-            "WEBDEBUG: fetch_doc_urls: _serpapi_search returned %d results",
-            len(serp_results),
+        log.warning("WEBDEBUG: fetch_doc_urls: trying Brave first")
+        brave_results = _brave_search(query, max_results=limit)
+        log.warning(
+            "WEBDEBUG: fetch_doc_urls: Brave returned %d result(s)",
+            len(brave_results),
         )
-        for r in serp_results:
-            # r is a SearchResult dataclass: has .url, .title, .snippet, .provider
+        for r in brave_results:
             url = getattr(r, "url", None)
             if url and url not in urls:
                 urls.append(url)
         if urls:
             return urls[:limit]
+    except MetasearchError as e:
+        log.warning("WEBDEBUG: Brave search unavailable: %r", e)
     except Exception as e:
-        current_app.logger.warning(
-            "WEBDEBUG: fetch_doc_urls: direct SerpAPI failed: %r", e
-        )
+        log.warning("WEBDEBUG: Brave search error: %r", e)
 
-    # 2) Optional fallback to metasearch (if you want to keep it around)
+    # --- 2) SerpAPI direct ---
     try:
-        current_app.logger.warning(
-            "WEBDEBUG: fetch_doc_urls: falling back to metasearch(max_results=%d)",
-            limit,
+        log.warning("WEBDEBUG: fetch_doc_urls: falling back to SerpAPI")
+        serp_results = _serpapi_search(query, max_results=limit)
+        log.warning(
+            "WEBDEBUG: fetch_doc_urls: SerpAPI returned %d result(s)",
+            len(serp_results),
         )
+        for r in serp_results:
+            url = getattr(r, "url", None)
+            if url and url not in urls:
+                urls.append(url)
+        if urls:
+            return urls[:limit]
+    except MetasearchError as e:
+        log.warning("WEBDEBUG: SerpAPI unavailable: %r", e)
+    except Exception as e:
+        log.warning("WEBDEBUG: fetch_doc_urls: SerpAPI error: %r", e)
+
+    # --- 3) metasearch() fallback ---
+    try:
+        log.warning("WEBDEBUG: fetch_doc_urls: falling back to metasearch()")
         results = metasearch(query, max_results=limit)
         for r in results:
             url = getattr(r, "url", None)
             if url and url not in urls:
                 urls.append(url)
     except MetasearchError as e:
-        current_app.logger.warning(
-            "WEBDEBUG: fetch_doc_urls: metasearch_error after SerpAPI: %r", e
+        log.warning(
+            "WEBDEBUG: metasearch unavailable after Brave+SerpAPI: %r", e
         )
+    except Exception as e:
+        log.warning("WEBDEBUG: fetch_doc_urls: metasearch error: %r", e)
 
     return urls[:limit]
 
-# ---------- URL ingest helpers ----------
+
+# -------------------------------
+# URL ingest helpers
+# -------------------------------
 
 def _slug_from_url(url: str) -> str:
     """Turn a URL into a filesystem-safe slug for TXT filenames."""
@@ -220,7 +301,9 @@ def _extract_csv_text(text: str) -> str:
     return "\n".join(out_lines)
 
 
-# ---------- Non-hanging web ingest (used by background worker) ----------
+# -------------------------------
+# Non-hanging web ingest (used by background worker)
+# -------------------------------
 
 def ingest_url_web(url: str, case: str | None):
     """
@@ -260,17 +343,13 @@ def ingest_url_web(url: str, case: str | None):
         _log_debug(f"ingest_url_web: GET FAILED url={url}: {e!r}")
         raise RuntimeError(f"Network error fetching {url}: {e}")
 
-    # PDF: existing pipeline does everything (download, OCR, index)
+    # PDF: delegate to your main ingest pipeline (stub here)
     if "pdf" in ctype or url.lower().endswith(".pdf"):
-        try:
-            _log_debug(
-                f"ingest_url_web: PDF detected, delegating to ingest_source: {url}"
-            )
-            pdf_path, txt_path = ingest_source(url, case=case)
-            return pdf_path, txt_path
-        except Exception as e:
-            _log_debug(f"ingest_url_web: ingest_source FAILED for {url}: {e!r}")
-            raise
+        _log_debug(
+            f"ingest_url_web: PDF detected, delegating to ingest_source: {url}"
+        )
+        pdf_path, txt_path = ingest_source(url, case=case)
+        return pdf_path, txt_path
 
     # DOCX
     if (
@@ -350,453 +429,9 @@ def ingest_url_web(url: str, case: str | None):
     raise ValueError(f"Unsupported content type for ingest: {ctype or 'unknown'}")
 
 
-# ---------- Base Styles ----------
-
-BASE_STYLE = """
-<style>
-  :root {
-    color-scheme: dark;
-  }
-
-  body {
-    background: #05070b;
-    color: #e7ecf5;
-    font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
-    margin: 2rem;
-    max-width: 960px;
-  }
-
-  a {
-    color: #7fb4ff;
-    text-decoration: none;
-  }
-  a:hover {
-    text-decoration: underline;
-  }
-
-  nav {
-    margin-bottom: 1.5rem;
-  }
-  nav a {
-    margin-right: 1rem;
-    font-size: 0.95rem;
-  }
-
-  h1 {
-    margin-bottom: 0.25rem;
-  }
-  h2 {
-    margin-top: 1.5rem;
-  }
-
-  form {
-    margin-bottom: 1.5rem;
-  }
-  label {
-    display: inline-block;
-    min-width: 4.5rem;
-  }
-  input[type="text"],
-  input[type="number"] {
-    width: 25rem;
-    background: #111827;
-    border: 1px solid #374151;
-    color: #e7ecf5;
-    padding: 0.35rem 0.5rem;
-    border-radius: 4px;
-  }
-
-  button {
-    background: #2563eb;
-    border: none;
-    color: #f9fafb;
-    padding: 0.35rem 0.9rem;
-    border-radius: 4px;
-    cursor: pointer;
-  }
-  button:hover {
-    background: #1d4ed8;
-  }
-
-  .meta {
-    color: #9ca3af;
-    font-size: 0.9rem;
-  }
-
-  .result {
-    border-bottom: 1px solid #1f2937;
-    padding: 0.75rem 0;
-  }
-
-  .snippet {
-    margin-top: 0.5rem;
-  }
-
-  .score {
-    font-size: 0.85rem;
-    color: #9ca3af;
-  }
-
-  code, pre {
-    font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas,
-      "Liberation Mono", "Courier New", monospace;
-    font-size: 0.9rem;
-  }
-
-  table {
-    border-collapse: collapse;
-    width: 100%;
-  }
-  th, td {
-    border-bottom: 1px solid #1f2937;
-    padding: 0.4rem 0.25rem;
-    text-align: left;
-  }
-  th {
-    font-weight: 600;
-  }
-
-  .error {
-    color: #f97373;
-    margin-top: 0.5rem;
-  }
-
-  .ingested-item {
-    border-bottom: 1px solid #1f2937;
-    padding: 0.5rem 0;
-  }
-</style>
-"""
-
-
-# ---------- Templates ----------
-
-INDEX_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Straightline Vault Search</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-  <a href="/cases">Cases</a>
-  <a href="/recent">Recent</a>
-  <a href="/web-ingest">Web Ingest</a>
-</nav>
-
-<h1>Straightline Vault</h1>
-<p class="meta">Full-text search across your ingested corpus. Nginx basic auth protects this interface.</p>
-
-<form method="get" action="/">
-  <div>
-    <label for="q">Query</label>
-    <input type="text" id="q" name="q" value="{{ q|e }}" autofocus>
-  </div>
-  <div>
-    <label for="case">Case</label>
-    <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="optional">
-  </div>
-  <div>
-    <label for="kind">Kind</label>
-    <input type="text" id="kind" name="kind" value="{{ kind|e }}" placeholder="local_file, url_fetch, web_html">
-  </div>
-  <div style="margin-top: 0.5rem;">
-    <label for="limit">Limit</label>
-    <input type="number" id="limit" name="limit" value="{{ limit }}">
-    <button type="submit">Search</button>
-  </div>
-</form>
-
-{% if q %}
-  <h2>Results for <code>{{ q }}</code></h2>
-  {% if results %}
-    <p class="meta">{{ results|length }} result(s) shown.</p>
-    {% for r in results %}
-      <div class="result">
-        <div>
-          <strong><a href="/doc/{{ r.doc_id }}">{{ r.doc_id }}</a></strong>
-          <span class="score">(score={{ "%.2f"|format(r.score) }})</span>
-        </div>
-        <div class="meta">
-          Source: <code>{{ r.source }}</code>
-          {% if r.case or r.kind %}
-            —
-            {% if r.case %}case={{ r.case }}{% endif %}
-            {% if r.kind %} kind={{ r.kind }}{% endif %}
-          {% endif %}
-        </div>
-        <div class="snippet">{{ r.snippet|safe }}</div>
-      </div>
-    {% endfor %}
-  {% else %}
-    <p>No results found.</p>
-  {% endif %}
-{% endif %}
-</body></html>
-"""
-
-CASES_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Straightline Vault — Cases</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-  <a href="/cases">Cases</a>
-  <a href="/recent">Recent</a>
-  <a href="/web-ingest">Web Ingest</a>
-</nav>
-
-<h1>Cases</h1>
-<p class="meta">Overview of all cases in the manifest.</p>
-
-{% if not cases %}
-  <p>No cases found.</p>
-{% else %}
-  <table>
-    <thead>
-      <tr><th>Case</th><th>Total docs</th><th>Kind breakdown</th></tr>
-    </thead>
-    <tbody>
-      {% for case_name, info in cases %}
-        <tr>
-          <td><a href="/case/{{ case_name }}">{{ case_name }}</a></td>
-          <td>{{ info.total }}</td>
-          <td>
-            {% for kind, count in info.kinds.items() %}
-              {{ kind }}={{ count }}{% if not loop.last %}, {% endif %}
-            {% endfor %}
-          </td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% endif %}
-</body></html>
-"""
-
-CASE_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Straightline Vault — Case {{ case_name }}</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-  <a href="/cases">Cases</a>
-  <a href="/recent">Recent</a>
-  <a href="/web-ingest">Web Ingest</a>
-</nav>
-
-<h1>Case: {{ case_name }}</h1>
-<p class="meta">
-  {{ docs|length }} document(s) in this case.
-  —
-  <a href="/?case={{ case_name|e }}">Search within this case</a>
-</p>
-
-{% if not docs %}
-  <p>No documents found for this case.</p>
-{% else %}
-  <table>
-    <thead>
-      <tr><th>Doc ID</th><th>Kind</th><th>PDF</th><th>Source URL</th></tr>
-    </thead>
-    <tbody>
-      {% for d in docs %}
-        <tr>
-          <td><a href="/doc/{{ d.doc_id }}">{{ d.doc_id }}</a></td>
-          <td>{{ d.kind or "" }}</td>
-          <td><code>{{ d.pdf or "" }}</code></td>
-          <td>{% if d.source_url %}<code>{{ d.source_url }}</code>{% endif %}</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% endif %}
-</body></html>
-"""
-
-RECENT_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8"><title>Straightline Vault — Recent Docs</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-  <a href="/cases">Cases</a>
-  <a href="/recent">Recent</a>
-  <a href="/web-ingest">Web Ingest</a>
-</nav>
-
-<h1>Recent Documents</h1>
-<p class="meta">
-  Most recent ingested documents, ordered by manifest timestamp (newest first).
-</p>
-
-{% if not docs %}
-  <p>No documents found in manifest.</p>
-{% else %}
-  <table>
-    <thead>
-      <tr>
-        <th>Timestamp (UTC)</th>
-        <th>Doc ID</th>
-        <th>Case</th>
-        <th>Kind</th>
-        <th>Source URL</th>
-      </tr>
-    </thead>
-    <tbody>
-      {% for d in docs %}
-        <tr>
-          <td><code>{{ d.timestamp }}</code></td>
-          <td><a href="/doc/{{ d.doc_id }}">{{ d.doc_id }}</a></td>
-          <td>{{ d.case or "" }}</td>
-          <td>{{ d.kind or "" }}</td>
-          <td>{% if d.source_url %}<code>{{ d.source_url }}</code>{% endif %}</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% endif %}
-</body></html>
-"""
-
-DOC_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<title>Straightline Vault — {{ doc_id }}</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-  <a href="/cases">Cases</a>
-  <a href="/recent">Recent</a>
-  <a href="/web-ingest">Web Ingest</a>
-</nav>
-
-<h1>Document: {{ doc_id }}</h1>
-<p class="meta">
-  {% if case_name %}case={{ case_name }} — {% endif %}
-  {% if kind %}kind={{ kind }} — {% endif %}
-  {% if pdf %}PDF: <code>{{ pdf }}</code> — {% endif %}
-  {% if source_url %}Source URL: <code>{{ source_url }}</code>{% endif %}
-</p>
-
-<h2>OCR Text</h2>
-{% if error %}
-  <p class="meta">Error reading OCR text: {{ error }}</p>
-{% else %}
-  <pre>{{ content }}</pre>
-{% endif %}
-</body></html>
-"""
-
-WEB_INGEST_TEMPLATE = """
-<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<title>Straightline Vault — Web Ingest</title>
-{{ style|safe }}
-</head>
-<body>
-<nav>
-  <a href="/">Search</a>
-  <a href="/cases">Cases</a>
-  <a href="/recent">Recent</a>
-  <a href="/web-ingest">Web Ingest</a>
-</nav>
-
-<h1>Web Ingest</h1>
-<p class="meta">
-  Search the public web for documents (PDF, HTML, text, DOCX, CSV) and ingest them into a case.
-  PDFs go through the existing pipeline; other types are converted to text and stored.
-</p>
-
-<form method="post" action="/web-ingest">
-  <div>
-    <label for="q">Query</label>
-    <input type="text" id="q" name="q" value="{{ query|e }}" placeholder="e.g. Jamal Khashoggi CIA report">
-  </div>
-
-  <div>
-    <label for="case">Case (optional)</label>
-    <input type="text" id="case" name="case" value="{{ case|e }}" placeholder="auto if blank">
-  </div>
-
-  <div>
-    <label for="limit">Limit</label>
-    <input type="number" id="limit" name="limit" value="{{ limit }}">
-    <button type="submit">Search &amp; Ingest</button>
-  </div>
-
-  {% if error %}
-    <div class="error">{{ error }}</div>
-  {% endif %}
-</form>
-
-{% if pdf_urls %}
-  <h2>URLs Found</h2>
-  <ul>
-    {% for u in pdf_urls %}
-      <li><code>{{ u }}</code></li>
-    {% endfor %}
-  </ul>
-{% endif %}
-
-{% if ingested %}
-  <h2>Ingest Results</h2>
-  <p class="meta">Case: <strong>{{ case }}</strong></p>
-  {% for item in ingested %}
-    <div class="ingested-item">
-      <div><strong>URL:</strong> <code>{{ item.url }}</code></div>
-      {% if item.error %}
-        <div class="error"><strong>Error:</strong> {{ item.error }}</div>
-      {% else %}
-        {% if item.job_path %}
-          <div>Job file: <code>{{ item.job_path }}</code></div>
-        {% else %}
-          <div class="meta">Queued (no job_path recorded).</div>
-        {% endif %}
-      {% endif %}
-    </div>
-  {% endfor %}
-{% endif %}
-
-{% if queue_jobs %}
-  <h2>Pending Jobs</h2>
-  <p class="meta">{{ queue_jobs|length }} job(s) currently in queue.</p>
-  <table>
-    <thead>
-      <tr><th>Job file</th><th>Case</th><th>URL</th><th>Queued at (UTC)</th></tr>
-    </thead>
-    <tbody>
-      {% for j in queue_jobs %}
-        <tr>
-          <td><code>{{ j.name }}</code></td>
-          <td>{{ j.case or "" }}</td>
-          <td><code>{{ j.url or "" }}</code></td>
-          <td>{{ j.queued_at }}</td>
-        </tr>
-      {% endfor %}
-    </tbody>
-  </table>
-{% endif %}
-
-</body></html>
-"""
-
-
-# ---------- Helpers ----------
+# -------------------------------
+# Helper functions
+# -------------------------------
 
 def build_case_stats():
     stats = defaultdict(lambda: {"total": 0, "kinds": defaultdict(int)})
@@ -879,9 +514,16 @@ def iter_recent_docs(limit: int = 50):
         if not ts:
             return datetime.min
         try:
-            # Handles normal isoformat, including fractions
-            return datetime.fromisoformat(ts)
+            # Normalize "Z" to explicit UTC offset, if present
+            ts_norm = ts.replace("Z", "+00:00")
+            dt = datetime.fromisoformat(ts_norm)
+
+            # Force everything to *naive UTC* so comparisons are valid
+            if dt.tzinfo is not None:
+                dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+            return dt
         except Exception:
+            # If anything goes weird, treat as oldest
             return datetime.min
 
     # Sort newest first
@@ -908,7 +550,9 @@ def iter_recent_docs(limit: int = 50):
     return docs
 
 
-# ---------- Routes ----------
+# -------------------------------
+# Routes
+# -------------------------------
 
 @app.route("/", methods=["GET"])
 def index():
@@ -950,97 +594,27 @@ def index():
                 "doc_id": doc_id,
                 "score": score,
                 "snippet": snippet,
-                # Prefer search backend's source, fall back to manifest source_url/txt/pdf
-                "source": source
-                or rec.get("source_url")
-                or rec.get("txt")
-                or rec.get("pdf"),
+                # Prefer search backend's source, fall back to manifest
+                "source": (
+                    source
+                    or rec.get("source_url")
+                    or rec.get("txt")
+                    or rec.get("pdf")
+                ),
                 "case": rec.get("case"),
                 "kind": rec.get("kind"),
             }
         )
 
-    return render_template_string(
-        INDEX_TEMPLATE,
-        style=BASE_STYLE,
+    return render_template(
+        "search.html",
         q=q,
         case=case or "",
         kind=kind or "",
         limit=limit,
         results=enriched_results,
-    )
-
-
-@app.route("/cases", methods=["GET"])
-def cases_view():
-    return render_template_string(
-        CASES_TEMPLATE,
-        style=BASE_STYLE,
-        cases=build_case_stats(),
-    )
-
-
-@app.route("/recent", methods=["GET"])
-def recent_view():
-    docs = iter_recent_docs(limit=50)
-    return render_template_string(
-        RECENT_TEMPLATE,
-        style=BASE_STYLE,
-        docs=docs,
-    )
-
-
-@app.route("/case/<case_name>", methods=["GET"])
-def case_view(case_name: str):
-    docs = []
-    for rec in iter_manifest() or []:
-        if (rec.get("case") or "uncategorized") != case_name:
-            continue
-
-        txt = rec.get("txt")
-        pdf = rec.get("pdf")
-        source_url = rec.get("source_url")
-
-        if not txt:
-            continue
-
-        p = Path(txt)
-        docs.append(
-            {
-                "doc_id": p.stem,
-                "kind": rec.get("kind"),
-                "pdf": pdf,
-                "source_url": source_url,
-            }
-        )
-
-    return render_template_string(
-        CASE_TEMPLATE,
-        style=BASE_STYLE,
-        case_name=case_name,
-        docs=docs,
-    )
-
-
-@app.route("/doc/<doc_id>", methods=["GET"])
-def doc_view(doc_id: str):
-    rec = find_manifest_by_doc_id(doc_id)
-    if not rec:
-        abort(404, description=f"No manifest record found for doc_id={doc_id!r}")
-
-    txt_path = rec.get("txt")
-    content, error = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing.")
-
-    return render_template_string(
-        DOC_TEMPLATE,
-        style=BASE_STYLE,
-        doc_id=doc_id,
-        case_name=rec.get("case"),
-        kind=rec.get("kind"),
-        pdf=rec.get("pdf"),
-        source_url=rec.get("source_url"),
-        content=content,
-        error=error,
+        error=None,
+        active_nav="search",
     )
 
 
@@ -1050,9 +624,9 @@ def web_ingest():
     Web-ingest is available to *any* nginx-authenticated user.
     Nginx basic auth is the real gate; Flask does not ask for another login.
     """
-    query = ""
-    case = ""
-    limit = 10
+    query: str = ""
+    case: str = ""
+    limit: int = 10
     error: str | None = None
     pdf_urls: list[str] = []
     ingested: list[dict] = []
@@ -1112,14 +686,13 @@ def web_ingest():
                             )
 
     # --- Always show current queue state, even on GET ---
-
     queue_jobs: list[dict] = []
     try:
         if JOBS_QUEUE_DIR.exists():
             for p in sorted(JOBS_QUEUE_DIR.glob("*.json")):
                 # filename pattern: {ts}-{pid}-{safe_case}.json
                 name = p.name
-                ts_ms = None
+                ts_ms: int | None = None
                 case_from_name: str | None = None
 
                 parts = name.split("-", 2)
@@ -1136,7 +709,9 @@ def web_ingest():
                 queued_at = ""
                 if ts_ms is not None:
                     try:
-                        queued_at = datetime.utcfromtimestamp(ts_ms / 1000.0).isoformat()
+                        queued_at = datetime.utcfromtimestamp(
+                            ts_ms / 1000.0
+                        ).isoformat()
                     except Exception:
                         queued_at = ""
 
@@ -1162,9 +737,8 @@ def web_ingest():
         _log_debug(f"web_ingest: failed to list queue jobs: {e!r}")
         queue_jobs = []
 
-    return render_template_string(
-        WEB_INGEST_TEMPLATE,
-        style=BASE_STYLE,
+    return render_template(
+        "web_ingest.html",
         query=query,
         case=case,
         limit=limit,
@@ -1172,4 +746,102 @@ def web_ingest():
         pdf_urls=pdf_urls,
         ingested=ingested,
         queue_jobs=queue_jobs,
+        active_nav="web_ingest",
+    )
+
+
+@app.route("/cases", methods=["GET"])
+def cases_view():
+    """
+    Cases / corpora overview.
+    Adapt build_case_stats() output into the shape expected by cases.html:
+      - name
+      - doc_count
+      - kinds (list or string)
+    """
+    raw_stats = build_case_stats()
+    cases = []
+
+    for case_name, info in raw_stats:
+        # info: {"total": int, "kinds": {kind: count}}
+        kinds_dict = info.get("kinds", {}) or {}
+
+        # Turn kind counts into a readable list like ["local_file=10", "web_html=3"]
+        kinds_list = [f"{k}={v}" for k, v in kinds_dict.items()]
+
+        cases.append(
+            {
+                "name": case_name,
+                "doc_count": info.get("total", 0),
+                "kinds": kinds_list,
+            }
+        )
+
+    return render_template(
+        "cases.html",
+        cases=cases,
+        active_nav="cases",
+    )
+
+@app.route("/recent", methods=["GET"])
+def recent_view():
+    docs = iter_recent_docs(limit=50)
+    return render_template(
+        "recent.html",
+        docs=docs,
+        active_nav="recent",
+    )
+
+
+@app.route("/case/<case_name>", methods=["GET"])
+def case_view(case_name: str):
+    docs = []
+    for rec in iter_manifest() or []:
+        if (rec.get("case") or "uncategorized") != case_name:
+            continue
+
+        txt = rec.get("txt")
+        pdf = rec.get("pdf")
+        source_url = rec.get("source_url")
+
+        if not txt:
+            continue
+
+        p = Path(txt)
+        docs.append(
+            {
+                "doc_id": p.stem,
+                "kind": rec.get("kind"),
+                "pdf": pdf,
+                "source_url": source_url,
+            }
+        )
+
+    return render_template(
+        "case.html",
+        case_name=case_name,
+        docs=docs,
+        active_nav="cases",
+    )
+
+
+@app.route("/doc/<doc_id>", methods=["GET"])
+def doc_view(doc_id: str):
+    rec = find_manifest_by_doc_id(doc_id)
+    if not rec:
+        abort(404, description=f"No manifest record found for doc_id={doc_id!r}")
+
+    txt_path = rec.get("txt")
+    content, error = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing")
+
+    return render_template(
+        "doc.html",
+        doc_id=doc_id,
+        case_name=rec.get("case"),
+        kind=rec.get("kind"),
+        pdf=rec.get("pdf"),
+        source_url=rec.get("source_url"),
+        content=content,
+        error=error,
+        active_nav=None,
     )

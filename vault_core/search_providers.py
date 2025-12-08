@@ -1,87 +1,80 @@
+#!/usr/bin/env python
 from __future__ import annotations
 
 import os
+import logging
 from dataclasses import dataclass
-from typing import List, Iterable
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+from typing import List
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
 class SearchResult:
-    """
-    Minimal search result shape exposed to callers.
-
-    The rest of your app only *needs* .url, but we also
-    carry title/snippet for future UI use if desired.
-    """
     url: str
-    title: str | None = None
-    snippet: str | None = None
-    provider: str | None = None
+    title: str
+    snippet: str
+    provider: str
 
 
-class MetasearchError(RuntimeError):
+class MetasearchError(Exception):
+    """Raised when no search provider can satisfy a query."""
     pass
-
-
-# Global timeout knobs for all providers (seconds)
-CONNECT_TIMEOUT = 5.0
-READ_TIMEOUT = 10.0
-PROVIDER_TIMEOUT = 8.0          # max time we'll wait per provider
-GLOBAL_TIMEOUT_MARGIN = 2.0     # global wait for as_completed
 
 
 def _brave_search(query: str, max_results: int = 10) -> List[SearchResult]:
     """
-    Brave Search API.
-    Requires env BRAVE_API_KEY set to a Brave subscription token.
+    Query Brave Web Search API.
+
+    Env vars checked (in this order):
+      - BRAVE_API_KEY
+      - BRAVE_SUBSCRIPTION_TOKEN
+
+    Raises MetasearchError if not configured or if the API call fails.
     """
-    api_key = os.getenv("BRAVE_API_KEY")
-    if not api_key:
-        # Not configured; just opt-out gracefully
-        return []
+    key = os.getenv("BRAVE_API_KEY") or os.getenv("BRAVE_SUBSCRIPTION_TOKEN")
+    if not key:
+        raise MetasearchError("BRAVE_API_KEY (or BRAVE_SUBSCRIPTION_TOKEN) not set")
+
+    max_results = max(1, min(max_results, 20))
 
     endpoint = "https://api.search.brave.com/res/v1/web/search"
-
-    headers = {
-        "Accept": "application/json",
-        "X-Subscription-Token": api_key,
-        "User-Agent": "StraightlineVault/0.1 (+non-malicious investigative use)",
-    }
-
     params = {
         "q": query,
         "count": max_results,
-        # You can tune these:
-        # "country": "us",
-        # "safesearch": "off",
+    }
+    headers = {
+        "X-Subscription-Token": key,
+        "Accept": "application/json",
     }
 
-    resp = requests.get(
-        endpoint,
-        headers=headers,
-        params=params,
-        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+    logger.warning(
+        "BRAVE_SEARCH: calling Brave API: endpoint=%s, count=%d", endpoint, max_results
     )
-    resp.raise_for_status()
 
     try:
+        resp = requests.get(endpoint, params=params, headers=headers, timeout=(5, 10))
+        resp.raise_for_status()
         data = resp.json()
-    except ValueError as e:
-        raise MetasearchError(f"Brave Search returned non-JSON: {e}") from e
+    except Exception as e:
+        logger.warning("BRAVE_SEARCH: request failed: %r", e)
+        raise MetasearchError(f"Brave request failed: {e!r}") from e
 
-    web = data.get("web", {})
-    items = web.get("results") or []
+    web_block = (data.get("web") or {})
+    raw_results = web_block.get("results") or []
 
     results: List[SearchResult] = []
-    for item in items:
-        url = item.get("url")
+    for r in raw_results:
+        url = r.get("url")
         if not url:
             continue
-        title = item.get("title")
-        snippet = item.get("description") or item.get("snippet")
+        title = r.get("title") or url
+        snippet = (
+            r.get("description")
+            or r.get("snippet")
+            or ""
+        )
         results.append(
             SearchResult(
                 url=url,
@@ -90,105 +83,55 @@ def _brave_search(query: str, max_results: int = 10) -> List[SearchResult]:
                 provider="brave",
             )
         )
-    return results
 
-
-def _google_cse_search(query: str, max_results: int = 10) -> List[SearchResult]:
-    """
-    Google Programmable Search Engine (Custom Search).
-    Requires:
-      - env GOOGLE_API_KEY
-      - env GOOGLE_CSE_CX
-    If either is missing, this provider is silently disabled.
-    """
-    api_key = os.getenv("GOOGLE_API_KEY")
-    cx = os.getenv("GOOGLE_CSE_CX")
-
-    if not api_key or not cx:
-        return []
-
-    endpoint = "https://www.googleapis.com/customsearch/v1"
-
-    params = {
-        "key": api_key,
-        "cx": cx,
-        "q": query,
-        "num": min(max_results, 10),  # Google caps at 10 per request
-    }
-
-    resp = requests.get(
-        endpoint,
-        params=params,
-        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
-    )
-    resp.raise_for_status()
-
-    try:
-        data = resp.json()
-    except ValueError as e:
-        raise MetasearchError(f"Google CSE returned non-JSON: {e}") from e
-
-    items = data.get("items") or []
-
-    results: List[SearchResult] = []
-    for item in items:
-        url = item.get("link")
-        if not url:
-            continue
-        title = item.get("title")
-        snippet = item.get("snippet")
-        results.append(
-            SearchResult(
-                url=url,
-                title=title,
-                snippet=snippet,
-                provider="google_cse",
-            )
-        )
-
+    logger.warning("BRAVE_SEARCH: got %d result(s)", len(results))
     return results
 
 
 def _serpapi_search(query: str, max_results: int = 10) -> List[SearchResult]:
     """
-    SerpAPI as another provider.
-    Requires env SERPAPI_API_KEY.
-    You can tweak engine/location as needed.
+    Query SerpAPI directly (Google engine).
+
+    Env var:
+      - SERPAPI_API_KEY
+
+    Raises MetasearchError if not configured or if the API call fails.
     """
-    api_key = os.getenv("SERPAPI_API_KEY")
-    if not api_key:
-        return []
+    key = os.getenv("SERPAPI_API_KEY")
+    if not key:
+        raise MetasearchError("SERPAPI_API_KEY not set")
 
-    endpoint = "https://serpapi.com/search"
+    max_results = max(1, min(max_results, 20))
 
+    endpoint = "https://serpapi.com/search.json"
     params = {
-        "api_key": api_key,
-        "engine": "google",
         "q": query,
+        "engine": "google",
         "num": max_results,
+        "api_key": key,
     }
 
-    resp = requests.get(
-        endpoint,
-        params=params,
-        timeout=(CONNECT_TIMEOUT, READ_TIMEOUT),
+    logger.warning(
+        "SERPAPI_SEARCH: calling SerpAPI: endpoint=%s, num=%d", endpoint, max_results
     )
-    resp.raise_for_status()
 
     try:
+        resp = requests.get(endpoint, params=params, timeout=(5, 10))
+        resp.raise_for_status()
         data = resp.json()
-    except ValueError as e:
-        raise MetasearchError(f"SerpAPI returned non-JSON: {e}") from e
+    except Exception as e:
+        logger.warning("SERPAPI_SEARCH: request failed: %r", e)
+        raise MetasearchError(f"SerpAPI request failed: {e!r}") from e
 
-    items = data.get("organic_results") or []
+    organic = data.get("organic_results") or []
 
     results: List[SearchResult] = []
-    for item in items:
-        url = item.get("link")
+    for r in organic:
+        url = r.get("link") or r.get("url")
         if not url:
             continue
-        title = item.get("title")
-        snippet = item.get("snippet") or item.get("description")
+        title = r.get("title") or url
+        snippet = r.get("snippet") or ""
         results.append(
             SearchResult(
                 url=url,
@@ -198,112 +141,41 @@ def _serpapi_search(query: str, max_results: int = 10) -> List[SearchResult]:
             )
         )
 
+    logger.warning("SERPAPI_SEARCH: got %d result(s)", len(results))
     return results
 
 
-def _enabled_providers():
+def metasearch(query: str, max_results: int = 10) -> List[SearchResult]:
     """
-    Decide which providers are *logically* enabled based on env vars.
-    This keeps metasearch a true 'meta' layer.
+    Simple hybrid metasearch:
+
+      1) Try Brave (if configured)
+      2) Fallback to SerpAPI (if configured)
+
+    If both fail or return nothing, raises MetasearchError.
     """
-    providers = []
+    max_results = max(1, min(max_results, 20))
 
-    # Brave
-    if os.getenv("BRAVE_API_KEY"):
-        providers.append(("brave", _brave_search))
-
-    # Google CSE
-    if os.getenv("GOOGLE_API_KEY") and os.getenv("GOOGLE_CSE_CX"):
-        providers.append(("google_cse", _google_cse_search))
-
-    # SerpAPI
-    if os.getenv("SERPAPI_API_KEY"):
-        providers.append(("serpapi", _serpapi_search))
-
-    return providers
-
-
-def metasearch(query: str, max_results: int = 10) -> Iterable[SearchResult]:
-    """
-    Public metasearch entry point.
-
-    - Fans out to all configured providers in parallel.
-    - Enforces per-provider timeouts.
-    - Deduplicates by URL.
-    - Returns up to `max_results` SearchResult objects.
-
-    Raises MetasearchError if *no* providers are configured,
-    or all providers fail / return nothing.
-    """
-    query = (query or "").strip()
-    if not query:
-        return []
-
-    providers = _enabled_providers()
-    if not providers:
-        raise MetasearchError(
-            "No web search providers configured. Set BRAVE_API_KEY and/or "
-            "GOOGLE_API_KEY + GOOGLE_CSE_CX and/or SERPAPI_API_KEY."
-        )
-
-    results: List[SearchResult] = []
-    seen_urls: set[str] = set()
-
-    # Submit all providers in parallel with their own internal HTTP timeouts.
-    with ThreadPoolExecutor(max_workers=len(providers)) as pool:
-        future_to_name = {
-            pool.submit(_run_provider_safe, name, func, query, max_results): name
-            for (name, func) in providers
-        }
-
-        # Global timeout guard so we don't hang forever even if a provider ignores timeouts.
-        try:
-            for fut in as_completed(
-                future_to_name, timeout=PROVIDER_TIMEOUT + GLOBAL_TIMEOUT_MARGIN
-            ):
-                try:
-                    provider_results = fut.result()
-                except MetasearchError:
-                    # Already logged inside _run_provider_safe
-                    continue
-                except Exception as e:
-                    # Shouldn't usually happen, but don't let it crash the meta layer
-                    print(f"[metasearch] provider {future_to_name[fut]} raised: {e}")
-                    continue
-
-                for r in provider_results:
-                    if r.url in seen_urls:
-                        continue
-                    seen_urls.add(r.url)
-                    results.append(r)
-                    if len(results) >= max_results:
-                        break
-                if len(results) >= max_results:
-                    break
-        except Exception as e:
-            # If as_completed times out or something odd happens
-            print(f"[metasearch] global timeout or error: {e}")
-
-    if not results:
-        raise MetasearchError("All web search providers failed or returned no results.")
-
-    return results
-
-
-def _run_provider_safe(
-    name: str,
-    func,
-    query: str,
-    max_results: int,
-) -> List[SearchResult]:
-    """
-    Helper to run a provider with a per-provider timeout and
-    nice error reporting.
-    """
+    # 1) Brave first
     try:
-        with ThreadPoolExecutor(max_workers=1) as pool:
-            future = pool.submit(func, query, max_results)
-            return future.result(timeout=PROVIDER_TIMEOUT)
+        brave_results = _brave_search(query, max_results=max_results)
+        if brave_results:
+            logger.warning("META: returning %d Brave result(s)", len(brave_results))
+            return brave_results
+    except MetasearchError as e:
+        logger.warning("META: Brave unavailable: %r", e)
     except Exception as e:
-        print(f"[metasearch] provider {name} error: {e}")
-        raise MetasearchError(f"Provider {name} failed: {e}") from e
+        logger.warning("META: unexpected Brave error: %r", e)
+
+    # 2) SerpAPI fallback
+    try:
+        serp_results = _serpapi_search(query, max_results=max_results)
+        if serp_results:
+            logger.warning("META: returning %d SerpAPI result(s)", len(serp_results))
+            return serp_results
+    except MetasearchError as e:
+        logger.warning("META: SerpAPI unavailable: %r", e)
+    except Exception as e:
+        logger.warning("META: unexpected SerpAPI error: %r", e)
+
+    raise MetasearchError("No search provider returned any results")

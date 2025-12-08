@@ -64,7 +64,7 @@ def search_index(query: str, limit: int = 10) -> List[Dict]:
             "score": float,
             "doc_id": str,
             "source_file": str,
-            "snippet": str,   # HTML with <b class="match term0">…</b>
+            "snippet": str,
         }
     """
     ix = _get_or_create_index()
@@ -93,4 +93,20 @@ def search_index(query: str, limit: int = 10) -> List[Dict]:
     return hits
 
 
-__all__ = ["update_index_for_file", "search_index"]
+def run_search(
+    query: str,
+    case: str | None = None,
+    kind: str | None = None,
+    limit: int = 20,
+):
+    """
+    Web/UI-facing wrapper for search.
+
+    `case` and `kind` are accepted for compatibility with the web UI,
+    but this simple Whoosh backend currently ignores them and just
+    does a full-text search over all indexed documents.
+    """
+    return search_index(query=query, limit=limit)
+
+
+__all__ = ["update_index_for_file", "search_index", "run_search"]

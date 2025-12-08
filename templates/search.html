@@ -1,0 +1,278 @@
+{% extends "base.html" %}
+
+{% block title %}Search · Straightline Vault{% endblock %}
+
+{% block header_meta %}
+  {% if q %}
+    Last query: “{{ q }}”
+  {% else %}
+    Ready for your next lead.
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+
+<section class="card">
+
+  <!-- Main header -->
+  <h2
+    style="
+      display:flex;
+      align-items:center;
+      gap:0.45rem;
+      color:#ffffcc;
+      font-size:1.05rem;
+      font-weight:600;
+      margin:0 0 0.35rem 0;
+    "
+  >
+    <!-- Sparkly magnifier -->
+    <span style="display:inline-flex; align-items:center;">
+      <svg width="26" height="26" viewBox="0 0 24 24"
+           fill="none"
+           stroke="#f9a8d4"
+           stroke-width="2"
+           stroke-linecap="round"
+           stroke-linejoin="round"
+           style="filter: drop-shadow(0 0 6px rgba(249,168,212,0.55)); vertical-align:middle;">
+
+        <!-- Lens -->
+        <circle cx="10" cy="10" r="6.5" stroke="#f9a8d4"/>
+
+        <!-- Sparkles -->
+        <circle cx="7" cy="7" r="1.1" fill="#fbcfe8"/>
+        <circle cx="13.5" cy="6" r="0.8" fill="#fdf2f8"/>
+        <circle cx="9" cy="13.5" r="0.9" fill="#fce7f3"/>
+
+        <!-- Handle -->
+        <line x1="14.5" y1="14.5" x2="20" y2="20" stroke="#f9a8d4"/>
+      </svg>
+    </span>
+
+    <span>Search The Entirety Of The Straightline Vault Corpus</span>
+  </h2>
+
+  <!-- Short tagline just under header -->
+  <p class="meta-soft" style="margin-top:0.1rem; opacity:0.9;">
+    No more rifling through multiple files in multiple locations by hand or with some shoddy AI tool,
+    to find relevant names, dates, and keywords.
+  </p>
+
+  <!-- Meta / instructions -->
+  <p class="meta" style="margin-top:0.75rem;">
+    With Vault Search, users can run powerful BM25 full-text searches of the Straightline Vault
+    by filling out the <strong>Query</strong> field with at least one keyword.
+    <br>
+    <span style="opacity:0.8;">
+      Tip: filter by <code>case</code> (e.g. <code>maxwell_1320</code>) or
+      <code>kind</code> (e.g. <code>web_html</code>) to narrow results.
+    </span>
+  </p>
+
+  <!-- Search form -->
+  <form method="get" action="/">
+
+    <!-- QUERY -->
+    <div class="field-row">
+      <label
+        for="q"
+        style="
+          width:7rem;
+          text-align:right;
+          opacity:0.95;
+          font-size:0.9rem;
+          font-weight:500;
+          display:flex;
+          align-items:center;
+          justify-content:flex-end;
+          gap:0.35rem;
+        "
+      >
+        <span style="display:inline-block; width:1.4rem; text-align:center;">🔍</span>
+        <span>Query</span>
+      </label>
+
+      <input
+        type="text"
+        id="q"
+        name="q"
+        value="{{ q or '' }}"
+        placeholder="e.g. flight log manifest, 'Khashoggi CIA', 'Maxwell deposition'"
+        autofocus
+      >
+    </div>
+
+    <!-- CASE -->
+    <div class="field-row">
+      <label
+        for="case"
+        style="
+          width:7rem;
+          text-align:right;
+          opacity:0.95;
+          font-size:0.9rem;
+          font-weight:500;
+          display:flex;
+          align-items:center;
+          justify-content:flex-end;
+          gap:0.35rem;
+        "
+      >
+        <span style="display:inline-block; width:1.4rem; text-align:center;">📁</span>
+        <span>Case</span>
+      </label>
+
+      <input
+        type="text"
+        id="case"
+        name="case"
+        value="{{ case or '' }}"
+        placeholder="optional (e.g. maxwell_1320, irs_travel)"
+      >
+    </div>
+
+    <!-- KIND -->
+    <div class="field-row">
+      <label
+        for="kind"
+        style="
+          width:7rem;
+          text-align:right;
+          opacity:0.95;
+          font-size:0.9rem;
+          font-weight:500;
+          display:flex;
+          align-items:center;
+          justify-content:flex-end;
+          gap:0.35rem;
+        "
+      >
+        <span style="display:inline-block; width:1.4rem; text-align:center;">🏷️</span>
+        <span>Kind</span>
+      </label>
+
+      <input
+        type="text"
+        id="kind"
+        name="kind"
+        value="{{ kind or '' }}"
+        placeholder="local_file, url_fetch, web_html"
+      >
+    </div>
+
+    <!-- LIMIT -->
+    <div class="field-row" style="margin-top:0.6rem;">
+      <label
+        for="limit"
+        style="
+          width:7rem;
+          text-align:right;
+          opacity:0.95;
+          font-size:0.9rem;
+          font-weight:500;
+          display:flex;
+          align-items:center;
+          justify-content:flex-end;
+          gap:0.35rem;
+        "
+      >
+        <span style="display:inline-block; width:1.4rem; text-align:center;">📊</span>
+        <span>Limit</span>
+      </label>
+
+      <input
+        type="number"
+        id="limit"
+        name="limit"
+        value="{{ limit or 20 }}"
+        min="1"
+        max="200"
+      >
+      <button type="submit">
+        <span class="icon">🚀</span>
+        Run search
+      </button>
+    </div>
+
+  </form>
+
+  {% if error %}
+    <div class="error">{{ error }}</div>
+  {% endif %}
+
+</section>
+
+<!-- Results section -->
+
+{% if results %}
+<section>
+  <h2>Results</h2>
+  <p class="meta">
+    Showing {{ results|length }} document{{ results|length != 1 and "s" or "" }}.
+  </p>
+
+  {% for r in results %}
+  <article class="card card--subtle result">
+    <div class="card-header">
+      <div>
+        {% if r.doc_id %}
+          <a href="/doc/{{ r.doc_id }}">{{ r.doc_id }}</a>
+
+          {% if r.source %}
+            <span class="meta" style="margin-left: 0.4rem;">
+              · <a href="{{ r.source }}" target="_blank" rel="noopener">source ↗</a>
+            </span>
+          {% endif %}
+        {% else %}
+          {% if r.source %}
+            <a href="/doc/{{ r.doc_id }}">{{ r.doc_id }}</a>
+          {% else %}
+            <span>Unknown document</span>
+          {% endif %}
+        {% endif %}
+
+        {% if r.case or r.kind %}
+          <div class="meta" style="margin-top: 0.25rem;">
+            {% if r.case %}
+              <span class="pill-badge pill-badge--case">Case file: {{ r.case }}</span>
+            {% endif %}
+            {% if r.kind %}
+              <span class="pill-badge pill-badge--kind">Ingest: {{ r.kind }}</span>
+            {% endif %}
+          </div>
+        {% endif %}
+
+        {% if r.score is not none %}
+          <div class="score">
+            Relevance: <strong>{{ "%.1f"|format(r.score) }}</strong>
+          </div>
+        {% endif %}
+      </div>
+    </div>
+
+    {% if r.snippet %}
+      <div class="snippet">{{ r.snippet|safe }}</div>
+    {% else %}
+      <p class="meta-soft" style="margin-top: 0.35rem;">
+        No snippet available — open the document for context.
+      </p>
+    {% endif %}
+  </article>
+  {% endfor %}
+</section>
+
+{% elif q %}
+  <p class="meta">
+    No results found for “{{ q }}”. Try:<br>
+    · Loosening the query wording<br>
+    · Removing case/kind filters<br>
+    · Confirming docs were indexed into this corpus
+  </p>
+
+{% else %}
+  <p class="meta">
+    No results yet — enter a query to begin searching your corpus.
+  </p>
+{% endif %}
+
+{% endblock %}
