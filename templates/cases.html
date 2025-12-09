@@ -9,8 +9,6 @@
 {% block content %}
 
 <section class="card">
-
-  <!-- Header -->
   <h2
     style="
       display:flex;
@@ -37,7 +35,6 @@
     Use this view to orient yourself before searching:
     which cases are heavy, which are sparse, and what ingest kinds are present.
   </p>
-
 </section>
 
 <section class="card card--subtle">
@@ -47,7 +44,7 @@
       Current cases ({{ cases|length }})
     </h3>
 
-    <table>
+    <table class="table--data">
       <thead>
         <tr>
           <th style="width:30%;">Case ID</th>
@@ -60,15 +57,22 @@
         {% for c in cases %}
         <tr>
           <td>
-            <span class="pill-badge pill-badge--case">
-              {{ c.name }}
-            </span>
+            <a
+              href="{{ url_for('case_view', case_name=c.name) }}"
+              style="text-decoration:none;"
+            >
+              <span class="pill-badge pill-badge--case">
+                {{ c.name }}
+              </span>
+            </a>
           </td>
+
           <td>
             <span class="meta">
               {{ c.doc_count or 0 }} doc{{ (c.doc_count or 0) != 1 and "s" or "" }}
             </span>
           </td>
+
           <td>
             {% if c.kinds %}
               <span class="meta-soft">
@@ -82,6 +86,7 @@
               <span class="meta-soft">—</span>
             {% endif %}
           </td>
+
           <td>
             <a
               href="/?case={{ c.name | urlencode }}"

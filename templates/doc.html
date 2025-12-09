@@ -1,0 +1,74 @@
+{% extends "base.html" %}
+
+{% block title %}Doc {{ doc_id }} · Straightline Vault{% endblock %}
+
+{% block header_meta %}
+  Single-document view for <code>{{ doc_id }}</code>.
+  {% if case_name %}
+    Case: <code>{{ case_name }}</code>.
+  {% endif %}
+{% endblock %}
+
+{% block content %}
+
+<section class="card">
+  <h2 style="margin-top:0; margin-bottom:0.5rem; display:flex; align-items:center; gap:0.5rem;">
+    <span>📄</span>
+    <span>Document: <code>{{ doc_id }}</code></span>
+  </h2>
+
+  <p class="meta" style="margin:0.25rem 0;">
+    {% if case_name %}
+      Case: <span class="pill-badge pill-badge--case">{{ case_name }}</span>
+    {% else %}
+      <span class="meta-soft">No case assigned</span>
+    {% endif %}
+  </p>
+
+  <p class="meta-soft" style="margin:0.25rem 0 0.75rem 0;">
+    Kind:
+    {% if kind %}
+      <span class="pill-badge pill-badge--kind">{{ kind }}</span>
+    {% else %}
+      <span class="meta-soft">unknown</span>
+    {% endif %}
+  </p>
+
+  {% if source_url %}
+    <p class="meta" style="margin-top:0.5rem;">
+      Source URL:
+      <a
+        href="{{ source_url }}"
+        target="_blank"
+        rel="noopener"
+      >
+        {{ source_url }}
+      </a>
+    </p>
+  {% elif pdf %}
+    <p class="meta" style="margin-top:0.5rem;">
+      PDF path:
+      <code>{{ pdf }}</code>
+    </p>
+  {% endif %}
+</section>
+
+<section class="card card--subtle">
+  {% if error %}
+    <p class="error">
+      Could not load text content for this document:
+      <br>
+      <code>{{ error }}</code>
+    </p>
+  {% elif content %}
+    <pre style="white-space:pre-wrap; word-wrap:break-word; font-size:0.9rem; line-height:1.4;">
+{{ content }}
+    </pre>
+  {% else %}
+    <p class="meta-soft">
+      No text content available for this document.
+    </p>
+  {% endif %}
+</section>
+
+{% endblock %}

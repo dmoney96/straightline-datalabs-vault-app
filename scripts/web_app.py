@@ -848,6 +848,7 @@ def cases_view():
         active_nav="cases",
     )
 
+
 @app.route("/recent", methods=["GET"])
 def recent_view():
     docs = iter_recent_docs(limit=50)
@@ -858,10 +859,15 @@ def recent_view():
     )
 
 
-@app.route("/case/<case_name>", methods=["GET"])
+@app.route("/cases/<case_name>", methods=["GET"])
 def case_view(case_name: str):
+    """
+    Detail view for a single case/corpus: shows the docs in that case.
+    URL pattern: /cases/<case_name>
+    """
     docs = []
     for rec in iter_manifest() or []:
+        # Default uncategorized if no case
         if (rec.get("case") or "uncategorized") != case_name:
             continue
 
