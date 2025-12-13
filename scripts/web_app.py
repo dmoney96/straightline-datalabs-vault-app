@@ -80,18 +80,14 @@ except Exception as e:
 # -------------------------------------------------------------------
 # Access token (currently not enforced)
 # -------------------------------------------------------------------
-ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN")
-logging.warning("WEBDEBUG ACCESS_TOKEN_LEN=%s", len(ACCESS_TOKEN) if ACCESS_TOKEN else 0)
+ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
 
+# Only log token length when explicitly debugging
+_log_debug(f"ACCESS_TOKEN_LEN={len(ACCESS_TOKEN)}")
 # -------------------------------------------------------------------
 # Internal Straightline Vault imports
 # -------------------------------------------------------------------
-from vault_core.search_providers import (
-    metasearch,
-    MetasearchError,
-    _serpapi_search,
-    _brave_search,
-)
+from vault_core.search_providers import metasearch
 
 from vault_core.manifest import (
     DATA_DIR,
@@ -118,8 +114,17 @@ OCR_DIR = DATA_DIR / "ocr"
 # Logging helpers
 # -------------------------------------------------------------------
 def _log_debug(msg: str) -> None:
-    print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
+    """
+    Central debug logger.
+    Enabled only when STRAIGHTLINE_DEBUG_SEARCH=1.
+    """
+    if os.getenv("STRAIGHTLINE_DEBUG_SEARCH") == "1":
+        print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
 
+def _require_localhost() -> None:
+    ra = request.remote_addr or ""
+    if ra not in ("127.0.0.1", "::1"):
+        abort(404)
 # -------------------------------------------------------------------
 # SSRF guard
 # -------------------------------------------------------------------
@@ -266,7 +271,7 @@ def _write_txt_and_manifest(text: str, url: str, case: str | None, kind: str) ->
     OCR_DIR.mkdir(parents=True, exist_ok=True)
     slug = _slug_from_url(url)
     txt_path = OCR_DIR / f"{slug}.txt"
-    txt_path.write_text(text, encoding="utf-8")
+    txt_path.write_text(text, encoding="utf-8", errors="replace")
 
     try:
         txt_rel = txt_path.relative_to(DATA_DIR)
@@ -533,8 +538,7 @@ def web_ingest():
 
             if not error:
                 # enqueue jobs
-                from pathlib import Path as _P
-                JOBS_ROOT = _P(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
+                JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
                 JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
                 JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -558,8 +562,7 @@ def web_ingest():
     # queue display
     queue_jobs: list[dict] = []
     try:
-        from pathlib import Path as _P
-        JOBS_ROOT = _P(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
+        JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
         JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
         if JOBS_QUEUE_DIR.exists():
             for p in sorted(JOBS_QUEUE_DIR.glob("*.json")):
@@ -657,7 +660,7 @@ def doc_view(doc_id: str):
     )
 
 # -------------------------------------------------------------------
-# Search routes (fixed + extra logging)
+# Search + index routes (NO DUPLICATES)
 # -------------------------------------------------------------------
 @app.route("/", methods=["GET"])
 def index_redirect():
@@ -679,18 +682,16 @@ def vault_search():
 
     NOTE: Keep endpoint name 'vault_search' stable for url_for().
     """
-    # RAW request logging (this is what you were trying to add)
-    _log_debug(
-        f"RAW: method={request.method} full_path={request.full_path!r} url={request.url!r} "
-        f"args={request.args.to_dict(flat=False)} form={request.form.to_dict(flat=False)}"
-    )
-
     # Prefer POST body if present, otherwise querystring
     query = (request.form.get("q") or request.form.get("query") or "").strip()
     if not query:
         query = (request.args.get("q") or request.args.get("query") or "").strip()
 
-    _log_debug(f"vault_search: method={request.method} q={query!r}")
+    # Debug (optional, gated)
+    _log_debug(
+        f"vault_search: method={request.method} full_path={request.full_path!r} "
+        f"q={query!r} args={request.args.to_dict(flat=False)} form={request.form.to_dict(flat=False)}"
+    )
 
     error: str | None = None
     results = []
@@ -713,15 +714,33 @@ def vault_search():
 @app.route("/debug/search", methods=["GET"])
 def debug_search():
     """
-    Quick verification endpoint.
-    Hit: /debug/search?q=epstein
-    Returns JSON so you can confirm the backend is returning results.
+    INTERNAL DEBUG ENDPOINT (localhost only)
+
+    Usage:
+      curl "http://127.0.0.1:5001/debug/search?q=epstein"
+
+    Purpose:
+      - Verifies that indexing + run_search() work end-to-end
+      - Must NEVER be exposed publicly
     """
+
+    # ---- HARD SAFETY GUARD ----
+    # Even if nginx/auth misconfigures, this endpoint is unreachable externally
+    remote = request.remote_addr or ""
+    if remote not in ("127.0.0.1", "::1"):
+        abort(404)
+
     q = (request.args.get("q") or "").strip()
     if not q:
         return {"error": "missing q"}, 400
+
     try:
         hits = run_search(q, limit=5)
-        return {"q": q, "count": len(hits), "hits": hits}
+        return {
+            "q": q,
+            "count": len(hits),
+            "hits": hits,
+        }
     except Exception as e:
+        current_app.logger.exception("debug_search failed")
         return {"q": q, "error": str(e)}, 500
