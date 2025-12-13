@@ -103,21 +103,32 @@
       <tbody>
         {% for r in search_results %}
           {% set ingest = ingested_by_url.get(r.url) if ingested_by_url is defined else None %}
+          {% set local_id = url_to_doc_id.get(r.url) if url_to_doc_id is defined else None %}
           <tr>
             <td>
-              {% if r.title %}
-                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
-                  {{ r.title }}
+              {% if local_id %}
+                {# Local doc exists: title links to local doc, plus a link to original #}
+                <a href="{{ url_for('doc_view', doc_id=local_id) }}">
+                  {{ r.title or r.url }}
                 </a>
-              {% else %}
-                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
-                  {{ r.url }}
-                </a>
-              {% endif %}
-              {% if r.engine %}
                 <div class="meta-soft" style="margin-top:0.2rem;">
-                  Source: {{ r.engine }}
+                  <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
+                    view original
+                  </a>
+                  {% if r.engine %}
+                    &nbsp;·&nbsp; Source: {{ r.engine }}
+                  {% endif %}
                 </div>
+              {% else %}
+                {# No local doc yet: fall back to original URL only #}
+                <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
+                  {{ r.title or r.url }}
+                </a>
+                {% if r.engine %}
+                  <div class="meta-soft" style="margin-top:0.2rem;">
+                    Source: {{ r.engine }}
+                  </div>
+                {% endif %}
               {% endif %}
             </td>
             <td>

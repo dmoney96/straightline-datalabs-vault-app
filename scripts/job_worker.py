@@ -9,14 +9,6 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
-# -------- Job directories --------
-
-JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
-QUEUE_DIR = JOBS_ROOT / "queue"
-PROCESSING_DIR = JOBS_ROOT / "processing"
-DONE_DIR = JOBS_ROOT / "done"
-FAILED_DIR = JOBS_ROOT / "failed"
-
 # -------- Python path so we can import web_app & vault_core --------
 
 ROOT = Path(__file__).resolve().parents[1]  # /home/dom/vault-app
@@ -27,10 +19,19 @@ SCRIPTS_DIR = ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-import web_app  # type: ignore[import]
+from web_app import (  # type: ignore[import]
+    ingest_url_web,
+    _log_debug,
+    JOBS_QUEUE_DIR,
+)
 
-ingest_url_web = web_app.ingest_url_web
-_log_debug = web_app._log_debug
+# -------- Job directories (derived from web_app's queue dir) --------
+
+JOBS_ROOT = JOBS_QUEUE_DIR.parent
+QUEUE_DIR = JOBS_QUEUE_DIR
+PROCESSING_DIR = JOBS_ROOT / "processing"
+DONE_DIR = JOBS_ROOT / "done"
+FAILED_DIR = JOBS_ROOT / "failed"
 
 POLL_INTERVAL = float(os.getenv("STRAIGHTLINE_JOB_POLL_INTERVAL", "1.0"))
 
