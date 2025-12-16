@@ -1,3 +1,4 @@
+{# templates/web_ingest.html #}
 {% extends "base.html" %}
 
 {% block title %}Ingest from web · Straightline Vault{% endblock %}
@@ -66,9 +67,22 @@
       >
     </div>
 
+    <div class="field-row">
+      <label for="token">Token</label>
+      <input
+        type="password"
+        id="token"
+        name="token"
+        placeholder="Straightline access token"
+        autocomplete="new-password"
+        required
+      >
+    </div>
+
     <button type="submit">
       🔍 Search web &amp; enqueue
     </button>
+
   </form>
 
   {% if error %}
@@ -131,6 +145,7 @@
                 {% endif %}
               {% endif %}
             </td>
+
             <td>
               {% if r.snippet %}
                 <div class="meta-soft">
@@ -140,6 +155,7 @@
                 <span class="meta-soft">No snippet provided.</span>
               {% endif %}
             </td>
+
             <td class="url-cell">
               <code>{{ r.url }}</code>
               <div style="margin-top:0.25rem;">
@@ -192,12 +208,8 @@
       <tbody>
         {% for job in queue_jobs %}
           <tr>
-            <td>
-              <code>{{ job.queued_at or "" }}</code>
-            </td>
-            <td>
-              {{ job.case or "" }}
-            </td>
+            <td><code>{{ job.queued_at or "" }}</code></td>
+            <td>{{ job.case or "" }}</td>
             <td class="url-cell">
               {% if job.url %}
                 <code>{{ job.url }}</code>

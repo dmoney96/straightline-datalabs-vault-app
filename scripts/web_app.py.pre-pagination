@@ -18,7 +18,6 @@ from urllib.parse import urlparse
 from functools import wraps
 import ipaddress
 import socket
-import hmac
 
 # --- Third-party imports ---
 import requests
@@ -43,7 +42,7 @@ if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
 # --- Flask imports AFTER sys.path is sane ---
-from flask import (  # noqa: E402
+from flask import (
     Flask,
     request,
     render_template,
@@ -70,7 +69,7 @@ app.secret_key = secret_key
 # -------------------------------------------------------------------
 limiter = None
 try:
-    from security_middleware import init_security  # type: ignore
+    from security_middleware import init_security
 
     limiter = init_security(app)
     logging.warning("Security middleware initialized successfully")
@@ -79,28 +78,30 @@ except Exception as e:
     logging.error("Security middleware init failed: %r", e)
 
 # -------------------------------------------------------------------
-# Access token (used by require_access)
+# Access token (currently not enforced)
 # -------------------------------------------------------------------
 ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
 
+# Only log token length when explicitly debugging
+_log_debug(f"ACCESS_TOKEN_LEN={len(ACCESS_TOKEN)}")
 # -------------------------------------------------------------------
 # Internal Straightline Vault imports
 # -------------------------------------------------------------------
-from vault_core.search_providers import metasearch  # noqa: E402
+from vault_core.search_providers import metasearch
 
-from vault_core.manifest import (  # noqa: E402
+from vault_core.manifest import (
     DATA_DIR,
     iter_manifest,
     append_manifest_entry,
 )
 
-from vault_core.search.indexer import (  # noqa: E402
+from vault_core.search.indexer import (
     run_search,
     update_index_for_file,
 )
 
 # Headless fetch helpers (Playwright)
-from headless_fetch import (  # noqa: E402
+from headless_fetch import (
     headless_can_use_for,
     headless_fetch_html,
     HEADLESS_ON_403,
@@ -120,48 +121,10 @@ def _log_debug(msg: str) -> None:
     if os.getenv("STRAIGHTLINE_DEBUG_SEARCH") == "1":
         print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
 
-
-# -------------------------------------------------------------------
-# Localhost-only guards for debug endpoints
-# -------------------------------------------------------------------
-def _is_loopback_ip(ip_str: str) -> bool:
-    ip_str = (ip_str or "").strip()
-    if not ip_str:
-        return False
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        return bool(ip.is_loopback)
-    except Exception:
-        return False
-
-
-def _require_debug_localhost_only() -> None:
-    """
-    Hard safety guard:
-      - Must be loopback at the TCP layer (request.remote_addr)
-      - AND if a proxy inserted XFF/X-Real-IP, those must also resolve to loopback
-        (so nginx can't "helpfully" expose this by forwarding real client IPs)
-    """
-    remote = (request.remote_addr or "").strip()
-    xff = (request.headers.get("X-Forwarded-For") or "").strip()
-    xri = (request.headers.get("X-Real-IP") or request.headers.get("X-Real-Ip") or "").strip()
-
-    # Must be locally connected
-    if not _is_loopback_ip(remote):
+def _require_localhost() -> None:
+    ra = request.remote_addr or ""
+    if ra not in ("127.0.0.1", "::1"):
         abort(404)
-
-    # If a proxy header is present, we require that the *client* it reports is ALSO loopback
-    # (this intentionally makes it unusable through nginx)
-    if xff:
-        first = xff.split(",")[0].strip()
-        if not _is_loopback_ip(first):
-            abort(404)
-
-    if xri:
-        if not _is_loopback_ip(xri.strip()):
-            abort(404)
-
-
 # -------------------------------------------------------------------
 # SSRF guard
 # -------------------------------------------------------------------
@@ -201,15 +164,16 @@ def _guard_remote_url(url: str) -> None:
             _log_debug(f"_guard_remote_url: blocked non-public IP {ip_str}")
             raise ValueError("non-public ip blocked")
 
-
 # -------------------------------------------------------------------
 # Search result presentation helpers
 # -------------------------------------------------------------------
 def _humanize_doc_id(doc_id: str) -> str:
+    # Turn "www_washingtonpost_com_politics_2025_12_12_epstein..." into something readable
     s = doc_id.replace("_", " ").strip()
+    # compress whitespace
     s = re.sub(r"\s+", " ", s)
+    # avoid screaming caps
     return s[:1].upper() + s[1:] if s else doc_id
-
 
 def _domain_from_url(url: str) -> str:
     try:
@@ -218,15 +182,14 @@ def _domain_from_url(url: str) -> str:
     except Exception:
         return ""
 
-
 def _summarize_path(path_str: str) -> str:
     try:
         p = Path(path_str)
+        # last 2 components is usually enough
         parts = p.parts[-2:] if len(p.parts) >= 2 else p.parts
         return "/".join(parts)
     except Exception:
         return path_str
-
 
 def _clip_snippet(snippet: str, max_chars: int = 420) -> str:
     if not snippet:
@@ -235,17 +198,17 @@ def _clip_snippet(snippet: str, max_chars: int = 420) -> str:
         return snippet
     return snippet[: max_chars - 1].rstrip() + "…"
 
-
 def _decorate_hit(hit: dict) -> dict:
     """
     Takes a raw run_search() hit and returns a UI-friendly dict.
-    Expected keys:
+    Expected keys (based on your debug output):
       - doc_id, score, snippet, source_file
     """
     doc_id = str(hit.get("doc_id") or "")
     source_file = str(hit.get("source_file") or "")
     snippet = str(hit.get("snippet") or "")
 
+    # Try to enrich using manifest (if present)
     rec = find_manifest_by_doc_id(doc_id)
     source_url = rec.get("source_url") if isinstance(rec, dict) else None
     kind = rec.get("kind") if isinstance(rec, dict) else None
@@ -254,7 +217,9 @@ def _decorate_hit(hit: dict) -> dict:
 
     domain = _domain_from_url(source_url) if source_url else ""
 
+    title = ""
     if source_url:
+        # prefer URL path-ish title
         title = source_url
     elif domain:
         title = domain
@@ -276,30 +241,44 @@ def _decorate_hit(hit: dict) -> dict:
         "timestamp": ts,
     }
 
-
 # -------------------------------------------------------------------
 # Access control decorator (no-op for now)
 # -------------------------------------------------------------------
+
 def require_access(view):
+    """
+    Lightweight token gate for sensitive routes.
+
+    Accepts token via:
+      - Authorization: Bearer <token>   (preferred)
+      - X-Access-Token: <token>         (fallback)
+      - ?token=<token>                  (convenience)
+      - form field token=<token>        (convenience)
+    """
     @wraps(view)
     def wrapped(*args, **kwargs):
-        # 1) Browser path: nginx Basic Auth succeeded and injected username
-        remote_user = (request.headers.get("X-Remote-User") or "").strip()
-        if remote_user:
-            return view(*args, **kwargs)
-
-        # 2) Direct-to-gunicorn debug path: curl -u user:pass http://127.0.0.1:5001/...
-        if request.authorization and (request.authorization.username or "").strip():
-            return view(*args, **kwargs)
-
-        # 3) CLI/API path: require header token only
-        expected = (ACCESS_TOKEN or "").strip()
+        expected = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
         if not expected:
+            # Fail closed if token isn't configured
             _log_debug("require_access: STRAIGHTLINE_ACCESS_TOKEN not set; denying")
             abort(403)
 
-        provided = (request.headers.get("X-Access-Token") or "").strip()
-        if not provided or not hmac.compare_digest(provided, expected):
+        provided = ""
+
+        # 1) Authorization header
+        auth = request.headers.get("Authorization", "")
+        if auth.lower().startswith("bearer "):
+            provided = auth.split(" ", 1)[1].strip()
+
+        # 2) Fallback headers / query / form
+        if not provided:
+            provided = (request.headers.get("X-Access-Token") or "").strip()
+        if not provided:
+            provided = (request.args.get("token") or "").strip()
+        if not provided:
+            provided = (request.form.get("token") or "").strip()
+
+        if not provided or provided != expected:
             _log_debug(
                 f"require_access: denied path={request.path!r} "
                 f"remote={request.remote_addr!r} ua={(request.headers.get('User-Agent') or '')[:80]!r}"
@@ -310,20 +289,17 @@ def require_access(view):
 
     return wrapped
 
-
 # -------------------------------------------------------------------
 # Index helpers
 # -------------------------------------------------------------------
 def index_txt_document(txt_path: str | Path) -> None:
     update_index_for_file(Path(txt_path))
 
-
 def _slug_from_url(url: str) -> str:
     parsed = urlparse(url)
     base = (parsed.netloc + parsed.path).lower()
     slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
     return slug or "web_doc"
-
 
 # -------------------------------------------------------------------
 # PDF ingest
@@ -404,7 +380,6 @@ def ingest_source(url: str, case: str | None = None):
 
     return pdf_path, txt_path
 
-
 # -------------------------------------------------------------------
 # Text/manifest helpers
 # -------------------------------------------------------------------
@@ -432,7 +407,6 @@ def _write_txt_and_manifest(text: str, url: str, case: str | None, kind: str) ->
     append_manifest_entry(entry)
     return txt_path
 
-
 def _extract_docx_text(content: bytes) -> str:
     if Document is None:
         raise RuntimeError("python-docx not installed. pip install python-docx")
@@ -445,14 +419,12 @@ def _extract_docx_text(content: bytes) -> str:
             parts.append(t)
     return "\n".join(parts)
 
-
 def _extract_csv_text(text: str) -> str:
     out_lines: list[str] = []
     reader = csv.reader(text.splitlines())
     for row in reader:
         out_lines.append("\t".join(cell.strip() for cell in row))
     return "\n".join(out_lines)
-
 
 # -------------------------------------------------------------------
 # Web ingest (used by worker)
@@ -536,7 +508,6 @@ def ingest_url_web(url: str, case: str | None):
 
     raise ValueError(f"Unsupported content type for ingest: {ctype or 'unknown'}")
 
-
 # -------------------------------------------------------------------
 # Manifest / display helpers
 # -------------------------------------------------------------------
@@ -552,17 +523,15 @@ def build_case_stats():
         key=lambda x: x[0],
     )
 
-
 def find_manifest_by_doc_id(doc_id: str):
     for rec in iter_manifest() or []:
         txt = rec.get("txt")
         if not txt:
             continue
-        p = Path(str(txt))
+        p = Path(txt)
         if p.stem == doc_id:
             return rec
     return None
-
 
 def load_ocr_text(path_str: str):
     try:
@@ -570,6 +539,7 @@ def load_ocr_text(path_str: str):
         if not p.is_absolute():
             p = DATA_DIR / p
 
+        # legacy fallback: some old entries might have been written outside DATA_DIR
         if not p.exists():
             legacy = ROOT / "ocr" / p.name
             if legacy.exists():
@@ -580,7 +550,6 @@ def load_ocr_text(path_str: str):
     except Exception as e:
         return None, str(e)
 
-
 def build_url_to_doc_id_map() -> dict[str, str]:
     mapping: dict[str, str] = {}
     for rec in iter_manifest() or []:
@@ -588,10 +557,9 @@ def build_url_to_doc_id_map() -> dict[str, str]:
         txt = rec.get("txt")
         if not src or not txt:
             continue
-        p = Path(str(txt))
-        mapping.setdefault(str(src), p.stem)
+        p = Path(txt)
+        mapping.setdefault(src, p.stem)
     return mapping
-
 
 def iter_recent_docs(limit: int = 50):
     records = list(iter_manifest() or [])
@@ -601,7 +569,7 @@ def iter_recent_docs(limit: int = 50):
         if not ts:
             return datetime.min
         try:
-            ts_norm = str(ts).replace("Z", "+00:00")
+            ts_norm = ts.replace("Z", "+00:00")
             dt = datetime.fromisoformat(ts_norm)
             if dt.tzinfo is not None:
                 dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
@@ -615,7 +583,7 @@ def iter_recent_docs(limit: int = 50):
         txt = rec.get("txt")
         if not txt:
             continue
-        p = Path(str(txt))
+        p = Path(txt)
         docs.append(
             {
                 "doc_id": p.stem,
@@ -626,7 +594,6 @@ def iter_recent_docs(limit: int = 50):
             }
         )
     return docs
-
 
 # -------------------------------------------------------------------
 # Routes
@@ -686,6 +653,7 @@ def web_ingest():
                 error = "No results returned from metasearch."
 
             if not error:
+                # enqueue jobs
                 JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
                 JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
                 JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
@@ -707,6 +675,7 @@ def web_ingest():
                     ingested.append(item)
                     ingested_by_url[url] = item
 
+    # queue display
     queue_jobs: list[dict] = []
     try:
         JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
@@ -757,7 +726,6 @@ def web_ingest():
         url_to_doc_id=url_to_doc_id,
     )
 
-
 @app.route("/cases", methods=["GET"])
 def cases_view():
     raw_stats = build_case_stats()
@@ -768,12 +736,10 @@ def cases_view():
         cases.append({"name": case_name, "doc_count": info.get("total", 0), "kinds": kinds_list})
     return render_template("cases.html", cases=cases, active_nav="cases")
 
-
 @app.route("/recent", methods=["GET"])
 def recent_view():
     docs = iter_recent_docs(limit=50)
     return render_template("recent.html", docs=docs, active_nav="recent")
-
 
 @app.route("/cases/<case_name>", methods=["GET"])
 def case_view(case_name: str):
@@ -784,17 +750,9 @@ def case_view(case_name: str):
         txt = rec.get("txt")
         if not txt:
             continue
-        p = Path(str(txt))
-        docs.append(
-            {
-                "doc_id": p.stem,
-                "kind": rec.get("kind"),
-                "pdf": rec.get("pdf"),
-                "source_url": rec.get("source_url"),
-            }
-        )
+        p = Path(txt)
+        docs.append({"doc_id": p.stem, "kind": rec.get("kind"), "pdf": rec.get("pdf"), "source_url": rec.get("source_url")})
     return render_template("case.html", case_name=case_name, docs=docs, active_nav="cases")
-
 
 @app.route("/doc/<doc_id>", methods=["GET"])
 def doc_view(doc_id: str):
@@ -817,22 +775,6 @@ def doc_view(doc_id: str):
         active_nav=None,
     )
 
-
-@app.route("/debug/whoami", methods=["GET"])
-def debug_whoami():
-    _require_debug_localhost_only()
-    xff = (request.headers.get("X-Forwarded-For") or "").strip()
-
-    return {
-        "client_ip": "127.0.0.1",
-        "remote_addr": request.remote_addr,
-        "x_remote_user": request.headers.get("X-Remote-User"),
-        "has_authorization_header": bool(request.headers.get("Authorization")),
-        "forwarded_for": xff,
-        "forwarded_proto": request.headers.get("X-Forwarded-Proto"),
-    }
-
-
 # -------------------------------------------------------------------
 # Search + index routes (NO DUPLICATES)
 # -------------------------------------------------------------------
@@ -840,63 +782,39 @@ def debug_whoami():
 def index_redirect():
     """
     Redirect / to /search while preserving querystring.
+    This fixes cases where the search form (or old links) hit /?q=...
     """
     if request.query_string:
         return redirect(url_for("vault_search") + "?" + request.query_string.decode("utf-8"))
     return redirect(url_for("vault_search"))
 
-
 @app.route("/vault-search", methods=["GET", "POST"])
 @app.route("/search", methods=["GET", "POST"])
 def vault_search():
     """
-    Search UI with pagination.
+    Accepts:
+      - GET  /search?q=term   (or ?query=term)
+      - POST /search with form field q or query
+
+    NOTE: Keep endpoint name 'vault_search' stable for url_for().
     """
+    # Prefer POST body if present, otherwise querystring
     query = (request.form.get("q") or request.form.get("query") or "").strip()
     if not query:
         query = (request.args.get("q") or request.args.get("query") or "").strip()
 
-    def _clamp_int(val, default, lo, hi):
-        try:
-            n = int(val)
-        except Exception:
-            n = default
-        return max(lo, min(hi, n))
-
-    page = _clamp_int(request.args.get("page"), 1, 1, 10_000)
-    per_page = _clamp_int(request.args.get("per_page"), 10, 5, 50)
-
+    # Debug (optional, gated)
     _log_debug(
-        f"vault_search: method={request.method} q={query!r} "
-        f"page={page} per_page={per_page}"
+        f"vault_search: method={request.method} full_path={request.full_path!r} "
+        f"q={query!r} args={request.args.to_dict(flat=False)} form={request.form.to_dict(flat=False)}"
     )
 
-    error = None
+    error: str | None = None
     results = []
-
-    showing_from = 0
-    showing_to = 0
-    has_prev = False
-    has_next = False
 
     if query:
         try:
-            fetch_limit = page * per_page
-            raw_hits = run_search(query, limit=fetch_limit)
-
-            start = (page - 1) * per_page
-            end = start + per_page
-
-            page_hits = raw_hits[start:end]
-            results = [_decorate_hit(h) for h in page_hits]
-
-            has_prev = page > 1
-            has_next = len(raw_hits) > end
-
-            if results:
-                showing_from = start + 1
-                showing_to = start + len(results)
-
+            results = run_search(query, limit=50)
         except Exception as e:
             current_app.logger.exception("vault_search: run_search failed")
             error = f"Search error: {e}"
@@ -907,21 +825,26 @@ def vault_search():
         results=results,
         error=error,
         active_nav="search",
-        page=page,
-        per_page=per_page,
-        has_prev=has_prev,
-        has_next=has_next,
-        showing_from=showing_from,
-        showing_to=showing_to,
     )
-
 
 @app.route("/debug/search", methods=["GET"])
 def debug_search():
     """
     INTERNAL DEBUG ENDPOINT (localhost only)
+
+    Usage:
+      curl "http://127.0.0.1:5001/debug/search?q=epstein"
+
+    Purpose:
+      - Verifies that indexing + run_search() work end-to-end
+      - Must NEVER be exposed publicly
     """
-    _require_debug_localhost_only()
+
+    # ---- HARD SAFETY GUARD ----
+    # Even if nginx/auth misconfigures, this endpoint is unreachable externally
+    remote = request.remote_addr or ""
+    if remote not in ("127.0.0.1", "::1"):
+        abort(404)
 
     q = (request.args.get("q") or "").strip()
     if not q:
