@@ -8,88 +8,93 @@
 {% endblock %}
 
 {% block content %}
+
 <section class="card">
 
-  <h2
-    style="
-      margin-top:0;
-      margin-bottom:0.4rem;
-      font-size:1.05rem;
-      font-weight:600;
-      color:#ffffcc;
-    "
-  >
-    Ingest from web
-  </h2>
+  <style>
+    /* Straightline: force readable centered layout even if parent template CSS drifts */
+    .slv-page {
+      max-width: 1100px;
+      margin: 0 auto;
+      padding: 24px 16px;
+      box-sizing: border-box;
+    }
+    .slv-page::after { content: ""; display: block; clear: both; }
+    .slv-page * { box-sizing: border-box; }
+  </style>
 
-  <p class="meta">
-    Start with a <strong>query</strong>. We hit Brave / SerpAPI / metasearch, show you
-    the results, and automatically enqueue document-like URLs (PDF, DOCX, CSV, TXT, or
-    docket-style pages) for background ingest.
-  </p>
+  <div class="slv-page">
 
-  <form method="post" style="margin-top:0.85rem;">
+    <h2
+      style="
+        margin-top:0;
+        margin-bottom:0.4rem;
+        font-size:1.05rem;
+        font-weight:600;
+        color:#ffffcc;
+      "
+    >
+      Ingest from web
+    </h2>
 
-    <div class="field-row">
-      <label for="query">Query</label>
-      <input
-        id="query"
-        name="query"
-        type="text"
-        required
-        autocomplete="off"
-        value="{{ query or '' }}"
-        placeholder="e.g. &quot;Maxwell 1320 docket pdf&quot; or &quot;Trump MRI abdomen pdf&quot;"
-      >
-    </div>
-
-    <div class="field-row">
-      <label for="case">Case</label>
-      <input
-        id="case"
-        name="case"
-        type="text"
-        autocomplete="off"
-        value="{{ case or '' }}"
-        placeholder="Optional: vault case ID (e.g. epstein_1320_web)"
-      >
-    </div>
-
-    <div class="field-row">
-      <label for="limit">Limit</label>
-      <input
-        id="limit"
-        name="limit"
-        type="number"
-        min="1"
-        max="20"
-        value="{{ limit or 10 }}"
-      >
-    </div>
-
-    <div class="field-row">
-      <label for="token">Token</label>
-      <input
-        type="password"
-        id="token"
-        name="token"
-        placeholder="Straightline access token"
-        autocomplete="new-password"
-        required
-      >
-    </div>
-
-    <button type="submit">
-      🔍 Search web &amp; enqueue
-    </button>
-
-  </form>
-
-  {% if error %}
-    <p class="error" style="margin-top:0.75rem;">
-      {{ error }}
+    <p class="meta">
+      Start with a <strong>query</strong>. We hit Brave / SerpAPI / metasearch, show you
+      the results, and automatically enqueue document-like URLs (PDF, DOCX, CSV, TXT, or
+      docket-style pages) for background ingest.
     </p>
-  {% endif %}
+
+    <form method="post" style="margin-top:0.85rem;">
+
+      <div class="field-row">
+        <label for="query">Query</label>
+        <input
+          id="query"
+          name="query"
+          type="text"
+          required
+          autocomplete="off"
+          value="{{ query or '' }}"
+          placeholder="e.g. &quot;Maxwell 1320 docket pdf&quot; or &quot;Trump MRI abdomen pdf&quot;"
+        >
+      </div>
+
+      <div class="field-row">
+        <label for="case">Case</label>
+        <input
+          id="case"
+          name="case"
+          type="text"
+          autocomplete="off"
+          value="{{ case or '' }}"
+          placeholder="Optional: vault case ID (e.g. epstein_1320_web)"
+        >
+      </div>
+
+      <div class="field-row">
+        <label for="limit">Limit</label>
+        <input
+          id="limit"
+          name="limit"
+          type="number"
+          min="1"
+          max="20"
+          value="{{ limit or 10 }}"
+        >
+      </div>
+
+      <button type="submit">
+        🔍 Search web &amp; enqueue
+      </button>
+
+    </form>
+
+    {% if error %}
+      <p class="error" style="margin-top:0.75rem;">
+        {{ error }}
+      </p>
+    {% endif %}
+
+  </div> <!-- /.slv-page -->
 
 </section>
 
@@ -121,7 +126,6 @@
           <tr>
             <td>
               {% if local_id %}
-                {# Local doc exists: title links to local doc, plus a link to original #}
                 <a href="{{ url_for('doc_view', doc_id=local_id) }}">
                   {{ r.title or r.url }}
                 </a>
@@ -134,7 +138,6 @@
                   {% endif %}
                 </div>
               {% else %}
-                {# No local doc yet: fall back to original URL only #}
                 <a href="{{ r.url }}" target="_blank" rel="noopener noreferrer">
                   {{ r.title or r.url }}
                 </a>
