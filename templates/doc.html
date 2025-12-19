@@ -12,63 +12,111 @@
 {% block content %}
 
 <section class="card">
-  <h2 style="margin-top:0; margin-bottom:0.5rem; display:flex; align-items:center; gap:0.5rem;">
+
+  <p style="margin:0 0 0.5rem 0; font-size:0.85rem; font-weight:600; color:#e5e7eb;">
+    Provenance metadata
+  </p>
+
+  <div
+    class="meta-soft"
+    style="
+      display:grid;
+      grid-template-columns: 140px 1fr;
+      gap:0.25rem 0.75rem;
+      font-size:0.85rem;
+    "
+  >
+    <div>Document ID</div>
+    <div><code>{{ doc_id }}</code></div>
+
+    <div>Case</div>
+    <div>
+      {% if case_name %}
+        <code>{{ case_name }}</code>
+      {% else %}
+        <span class="meta-soft">—</span>
+      {% endif %}
+    </div>
+
+    <div>Kind</div>
+    <div>
+      {% if kind %}
+        <code>{{ kind }}</code>
+      {% else %}
+        <span class="meta-soft">—</span>
+      {% endif %}
+    </div>
+
+    <div>Source URL</div>
+    <div>
+      {% if source_url %}
+        <a href="{{ source_url }}" target="_blank" rel="noopener">
+          {{ source_url }}
+        </a>
+      {% else %}
+        <span class="meta-soft">—</span>
+      {% endif %}
+    </div>
+
+    <div>PDF path</div>
+    <div>
+      {% if pdf %}
+        <code>{{ pdf }}</code>
+      {% else %}
+        <span class="meta-soft">—</span>
+      {% endif %}
+    </div>
+  </div>
+
+  <hr
+    style="
+      margin:0.9rem 0;
+      border:0;
+      border-top:1px solid #1f2937;
+    "
+  >
+
+  <h2
+    style="
+      margin:0;
+      display:flex;
+      align-items:center;
+      gap:0.5rem;
+    "
+  >
     <span>📄</span>
-    <span>Document: <code>{{ doc_id }}</code></span>
+    <span>Document content</span>
   </h2>
 
-  <p class="meta" style="margin:0.25rem 0;">
-    {% if case_name %}
-      Case: <span class="pill-badge pill-badge--case">{{ case_name }}</span>
-    {% else %}
-      <span class="meta-soft">No case assigned</span>
-    {% endif %}
-  </p>
-
-  <p class="meta-soft" style="margin:0.25rem 0 0.75rem 0;">
-    Kind:
-    {% if kind %}
-      <span class="pill-badge pill-badge--kind">{{ kind }}</span>
-    {% else %}
-      <span class="meta-soft">unknown</span>
-    {% endif %}
-  </p>
-
-  {% if source_url %}
-    <p class="meta" style="margin-top:0.5rem;">
-      Source URL:
-      <a
-        href="{{ source_url }}"
-        target="_blank"
-        rel="noopener"
-      >
-        {{ source_url }}
-      </a>
-    </p>
-  {% elif pdf %}
-    <p class="meta" style="margin-top:0.5rem;">
-      PDF path:
-      <code>{{ pdf }}</code>
-    </p>
-  {% endif %}
 </section>
 
 <section class="card card--subtle">
+
   {% if error %}
     <p class="error">
       Could not load text content for this document:
       <br>
       <code>{{ error }}</code>
     </p>
+
   {% elif content %}
-    <pre style="white-space:pre-wrap; word-wrap:break-word; font-size:0.9rem; line-height:1.4;">
+    <pre
+      style="
+        white-space:pre-wrap;
+        word-wrap:break-word;
+        font-size:0.9rem;
+        line-height:1.4;
+      "
+    >
 {{ content }}
     </pre>
+
   {% else %}
     <p class="meta-soft">
       No text content available for this document.
     </p>
   {% endif %}
+
 </section>
 
 {% endblock %}

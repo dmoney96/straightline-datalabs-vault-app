@@ -30,3 +30,14 @@ ocr/
 input/
 logs/
 *.log
+
+# --- Python bytecode / caches ---
+__pycache__/
+*.pyc
+
+# --- Straightline: local scratch + archived copies ---
+scripts/**/__pycache__/
+scripts/web_app.py.bak*
+scripts/web_app.py.save*
+scripts/web_app.py.backup*
+scripts/web_app.py.pre-pagination*

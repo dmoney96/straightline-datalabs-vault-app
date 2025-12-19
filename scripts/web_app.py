@@ -11,7 +11,7 @@ import json
 import time
 import logging
 import subprocess
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
 from urllib.parse import urlparse
@@ -24,6 +24,17 @@ import hmac
 import requests
 from requests import HTTPError
 from bs4 import BeautifulSoup
+
+from flask import (
+    Flask,
+    request,
+    render_template,
+    abort,
+    current_app,
+    redirect,
+    url_for,
+    session,
+)
 
 # --- Optional DOCX parsing ---
 try:
@@ -42,17 +53,6 @@ SCRIPTS_DIR = ROOT / "scripts"
 if str(SCRIPTS_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_DIR))
 
-# --- Flask imports AFTER sys.path is sane ---
-from flask import (  # noqa: E402
-    Flask,
-    request,
-    render_template,
-    abort,
-    current_app,
-    redirect,
-    url_for,
-)
-
 # -------------------------------------------------------------------
 # Flask app (single instance)
 # -------------------------------------------------------------------
@@ -65,21 +65,33 @@ if not secret_key:
     raise RuntimeError("STRAIGHTLINE_SECRET_KEY must be set")
 app.secret_key = secret_key
 
+# Session cookie hardening
+SESSION_MINUTES = int(os.getenv("STRAIGHTLINE_SESSION_MINUTES", "240"))  # default 4 hours
+app.config.update(
+    SESSION_COOKIE_HTTPONLY=True,
+    SESSION_COOKIE_SECURE=True,  # requires HTTPS (nginx terminates TLS)
+    SESSION_COOKIE_SAMESITE="Lax",
+    PERMANENT_SESSION_LIFETIME=timedelta(
+        minutes=max(5, min(SESSION_MINUTES, 7 * 24 * 60))
+    ),
+)
+
+# Optional CSRF enforcement (off by default)
+ENFORCE_CSRF = os.getenv("STRAIGHTLINE_CSRF", "0") == "1"
+
 # -------------------------------------------------------------------
 # Security middleware (optional but should not break app boot)
 # -------------------------------------------------------------------
 limiter = None
 try:
     from security_middleware import init_security  # type: ignore
-
     limiter = init_security(app)
     logging.warning("Security middleware initialized successfully")
 except Exception as e:
-    # Don’t brick the app if middleware import fails; log loudly.
     logging.error("Security middleware init failed: %r", e)
 
 # -------------------------------------------------------------------
-# Access token (used by require_access)
+# Access token (optional; used for internal CLI/API access)
 # -------------------------------------------------------------------
 ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
 
@@ -87,24 +99,13 @@ ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
 # Internal Straightline Vault imports
 # -------------------------------------------------------------------
 from vault_core.search_providers import metasearch  # noqa: E402
+from vault_core.manifest import DATA_DIR, iter_manifest, append_manifest_entry  # noqa: E402
+from vault_core.search.indexer import run_search, update_index_for_file  # noqa: E402
 
-from vault_core.manifest import (  # noqa: E402
-    DATA_DIR,
-    iter_manifest,
-    append_manifest_entry,
-)
+from headless_fetch import headless_can_use_for, headless_fetch_html, HEADLESS_ON_403  # noqa: E402
 
-from vault_core.search.indexer import (  # noqa: E402
-    run_search,
-    update_index_for_file,
-)
-
-# Headless fetch helpers (Playwright)
-from headless_fetch import (  # noqa: E402
-    headless_can_use_for,
-    headless_fetch_html,
-    HEADLESS_ON_403,
-)
+# Auth DB helper (SQLite)
+from vault_core.auth_db import consume_invite, verify_user  # noqa: E402
 
 # Fallback OCR directory
 OCR_DIR = DATA_DIR / "ocr"
@@ -113,54 +114,88 @@ OCR_DIR = DATA_DIR / "ocr"
 # Logging helpers
 # -------------------------------------------------------------------
 def _log_debug(msg: str) -> None:
-    """
-    Central debug logger.
-    Enabled only when STRAIGHTLINE_DEBUG_SEARCH=1.
-    """
+    # Keep it non-sensitive: never print tokens/passwords/env secrets.
     if os.getenv("STRAIGHTLINE_DEBUG_SEARCH") == "1":
         print(f"WEBDEBUG: {msg}", file=sys.stderr, flush=True)
 
+# -------------------------------------------------------------------
+# Security headers (defense-in-depth)
+# -------------------------------------------------------------------
+@app.after_request
+def _add_security_headers(resp):
+    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
+    resp.headers.setdefault("X-Frame-Options", "DENY")
+    resp.headers.setdefault("Referrer-Policy", "no-referrer")
+    resp.headers.setdefault(
+        "Content-Security-Policy",
+        "default-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+    )
+    return resp
 
 # -------------------------------------------------------------------
-# Localhost-only guards for debug endpoints
+# CSRF helper (optional)
 # -------------------------------------------------------------------
-def _is_loopback_ip(ip_str: str) -> bool:
-    ip_str = (ip_str or "").strip()
-    if not ip_str:
-        return False
-    try:
-        ip = ipaddress.ip_address(ip_str)
-        return bool(ip.is_loopback)
-    except Exception:
-        return False
+def _get_csrf_token() -> str:
+    tok = session.get("csrf_token")
+    if not tok:
+        tok = os.urandom(16).hex()
+        session["csrf_token"] = tok
+    return str(tok)
 
+def _require_csrf() -> None:
+    if not ENFORCE_CSRF:
+        return
+    if request.method != "POST":
+        return
+    provided = (request.form.get("csrf_token") or request.headers.get("X-CSRF-Token") or "").strip()
+    expected = (session.get("csrf_token") or "").strip()
+    if not expected or not provided or not hmac.compare_digest(provided, expected):
+        abort(400, description="CSRF token missing or invalid")
 
-def _require_debug_localhost_only() -> None:
-    """
-    Hard safety guard:
-      - Must be loopback at the TCP layer (request.remote_addr)
-      - AND if a proxy inserted XFF/X-Real-IP, those must also resolve to loopback
-        (so nginx can't "helpfully" expose this by forwarding real client IPs)
-    """
-    remote = (request.remote_addr or "").strip()
-    xff = (request.headers.get("X-Forwarded-For") or "").strip()
-    xri = (request.headers.get("X-Real-IP") or request.headers.get("X-Real-Ip") or "").strip()
+# -------------------------------------------------------------------
+# Auth helpers (Option B)
+# -------------------------------------------------------------------
+def _is_logged_in() -> bool:
+    return bool(session.get("auth") == "1" and session.get("user"))
 
-    # Must be locally connected
-    if not _is_loopback_ip(remote):
-        abort(404)
+def _safe_next_url(next_url: str) -> str:
+    next_url = (next_url or "").strip()
+    if not next_url:
+        return url_for("vault_search")
+    parsed = urlparse(next_url)
+    # No open redirects
+    if parsed.scheme or parsed.netloc:
+        return url_for("vault_search")
+    if not next_url.startswith("/"):
+        return url_for("vault_search")
+    return next_url
 
-    # If a proxy header is present, we require that the *client* it reports is ALSO loopback
-    # (this intentionally makes it unusable through nginx)
-    if xff:
-        first = xff.split(",")[0].strip()
-        if not _is_loopback_ip(first):
-            abort(404)
+@app.before_request
+def _refresh_session_on_activity():
+    # Sliding expiration: keep people logged in while actively using the site.
+    # If you want absolute expiration only, delete this function.
+    if _is_logged_in():
+        session.permanent = True
+        session.modified = True
 
-    if xri:
-        if not _is_loopback_ip(xri.strip()):
-            abort(404)
+def require_access(view):
+    @wraps(view)
+    def wrapped(*args, **kwargs):
+        # 1) Session login (Option B)
+        if _is_logged_in():
+            return view(*args, **kwargs)
 
+        # 2) API/tooling bypass (optional)
+        expected = (ACCESS_TOKEN or "").strip()
+        if expected:
+            provided = (request.headers.get("X-Access-Token") or "").strip()
+            if provided and hmac.compare_digest(provided, expected):
+                return view(*args, **kwargs)
+
+        # 3) Not authorized -> login (preserve next)
+        next_url = request.full_path if request.query_string else request.path
+        return redirect(url_for("login", next=next_url))
+    return wrapped
 
 # -------------------------------------------------------------------
 # SSRF guard
@@ -182,15 +217,10 @@ def _guard_remote_url(url: str) -> None:
         raise ValueError("dns failure") from e
 
     resolved_ips = sorted({info[4][0] for info in infos})
-    _log_debug(f"_guard_remote_url: {url!r} resolves to {resolved_ips}")
+    _log_debug(f"_guard_remote_url: resolves host={host!r} -> {resolved_ips}")
 
     for ip_str in resolved_ips:
-        try:
-            ip = ipaddress.ip_address(ip_str)
-        except Exception as e:
-            _log_debug(f"_guard_remote_url: unparsable ip {ip_str!r}: {e!r}")
-            raise ValueError("bad ip") from e
-
+        ip = ipaddress.ip_address(ip_str)
         if (
             ip.is_loopback
             or ip.is_private
@@ -201,15 +231,13 @@ def _guard_remote_url(url: str) -> None:
             _log_debug(f"_guard_remote_url: blocked non-public IP {ip_str}")
             raise ValueError("non-public ip blocked")
 
-
 # -------------------------------------------------------------------
-# Search result presentation helpers
+# Search result presentation helpers (YOU WERE MISSING THESE)
 # -------------------------------------------------------------------
 def _humanize_doc_id(doc_id: str) -> str:
     s = doc_id.replace("_", " ").strip()
     s = re.sub(r"\s+", " ", s)
     return s[:1].upper() + s[1:] if s else doc_id
-
 
 def _domain_from_url(url: str) -> str:
     try:
@@ -217,7 +245,6 @@ def _domain_from_url(url: str) -> str:
         return host or ""
     except Exception:
         return ""
-
 
 def _summarize_path(path_str: str) -> str:
     try:
@@ -227,7 +254,6 @@ def _summarize_path(path_str: str) -> str:
     except Exception:
         return path_str
 
-
 def _clip_snippet(snippet: str, max_chars: int = 420) -> str:
     if not snippet:
         return ""
@@ -235,13 +261,17 @@ def _clip_snippet(snippet: str, max_chars: int = 420) -> str:
         return snippet
     return snippet[: max_chars - 1].rstrip() + "…"
 
+def find_manifest_by_doc_id(doc_id: str):
+    for rec in iter_manifest() or []:
+        txt = rec.get("txt")
+        if not txt:
+            continue
+        p = Path(str(txt))
+        if p.stem == doc_id:
+            return rec
+    return None
 
 def _decorate_hit(hit: dict) -> dict:
-    """
-    Takes a raw run_search() hit and returns a UI-friendly dict.
-    Expected keys:
-      - doc_id, score, snippet, source_file
-    """
     doc_id = str(hit.get("doc_id") or "")
     source_file = str(hit.get("source_file") or "")
     snippet = str(hit.get("snippet") or "")
@@ -276,47 +306,11 @@ def _decorate_hit(hit: dict) -> dict:
         "timestamp": ts,
     }
 
-
-# -------------------------------------------------------------------
-# Access control decorator (no-op for now)
-# -------------------------------------------------------------------
-def require_access(view):
-    @wraps(view)
-    def wrapped(*args, **kwargs):
-        # 1) Browser path: nginx Basic Auth succeeded and injected username
-        remote_user = (request.headers.get("X-Remote-User") or "").strip()
-        if remote_user:
-            return view(*args, **kwargs)
-
-        # 2) Direct-to-gunicorn debug path: curl -u user:pass http://127.0.0.1:5001/...
-        if request.authorization and (request.authorization.username or "").strip():
-            return view(*args, **kwargs)
-
-        # 3) CLI/API path: require header token only
-        expected = (ACCESS_TOKEN or "").strip()
-        if not expected:
-            _log_debug("require_access: STRAIGHTLINE_ACCESS_TOKEN not set; denying")
-            abort(403)
-
-        provided = (request.headers.get("X-Access-Token") or "").strip()
-        if not provided or not hmac.compare_digest(provided, expected):
-            _log_debug(
-                f"require_access: denied path={request.path!r} "
-                f"remote={request.remote_addr!r} ua={(request.headers.get('User-Agent') or '')[:80]!r}"
-            )
-            abort(401)
-
-        return view(*args, **kwargs)
-
-    return wrapped
-
-
 # -------------------------------------------------------------------
 # Index helpers
 # -------------------------------------------------------------------
 def index_txt_document(txt_path: str | Path) -> None:
     update_index_for_file(Path(txt_path))
-
 
 def _slug_from_url(url: str) -> str:
     parsed = urlparse(url)
@@ -324,12 +318,11 @@ def _slug_from_url(url: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
     return slug or "web_doc"
 
-
 # -------------------------------------------------------------------
 # PDF ingest
 # -------------------------------------------------------------------
 def ingest_source(url: str, case: str | None = None):
-    _log_debug(f"ingest_source: START url={url!r}, case={case!r}")
+    _log_debug(f"ingest_source: START case={case!r}")
     _guard_remote_url(url)
 
     pdf_root = DATA_DIR / "web_pdfs"
@@ -342,17 +335,13 @@ def ingest_source(url: str, case: str | None = None):
         resp = requests.get(url, stream=True, timeout=(10, 60))
         resp.raise_for_status()
     except Exception as e:
-        _log_debug(f"ingest_source: PDF download FAILED for {url}: {e!r}")
+        _log_debug(f"ingest_source: PDF download FAILED: {e!r}")
         raise RuntimeError(f"Failed to download PDF from {url}: {e}") from e
 
-    try:
-        with pdf_path.open("wb") as f:
-            for chunk in resp.iter_content(chunk_size=8192):
-                if chunk:
-                    f.write(chunk)
-    except Exception as e:
-        _log_debug(f"ingest_source: writing PDF FAILED {pdf_path}: {e!r}")
-        raise RuntimeError(f"Failed to write PDF to {pdf_path}: {e}") from e
+    with pdf_path.open("wb") as f:
+        for chunk in resp.iter_content(chunk_size=8192):
+            if chunk:
+                f.write(chunk)
 
     OCR_DIR.mkdir(parents=True, exist_ok=True)
     txt_path = OCR_DIR / f"{slug}.txt"
@@ -365,9 +354,7 @@ def ingest_source(url: str, case: str | None = None):
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        raise RuntimeError(
-            "pdftotext not found. Install poppler-utils (sudo apt install poppler-utils)."
-        )
+        raise RuntimeError("pdftotext not found. Install poppler-utils (sudo apt install poppler-utils).")
     except subprocess.CalledProcessError as e:
         _log_debug(f"ingest_source: pdftotext FAILED for {pdf_path}: {e!r}")
         raise RuntimeError(f"pdftotext failed for {pdf_path}: {e}") from e
@@ -404,7 +391,6 @@ def ingest_source(url: str, case: str | None = None):
 
     return pdf_path, txt_path
 
-
 # -------------------------------------------------------------------
 # Text/manifest helpers
 # -------------------------------------------------------------------
@@ -432,7 +418,6 @@ def _write_txt_and_manifest(text: str, url: str, case: str | None, kind: str) ->
     append_manifest_entry(entry)
     return txt_path
 
-
 def _extract_docx_text(content: bytes) -> str:
     if Document is None:
         raise RuntimeError("python-docx not installed. pip install python-docx")
@@ -445,7 +430,6 @@ def _extract_docx_text(content: bytes) -> str:
             parts.append(t)
     return "\n".join(parts)
 
-
 def _extract_csv_text(text: str) -> str:
     out_lines: list[str] = []
     reader = csv.reader(text.splitlines())
@@ -453,12 +437,11 @@ def _extract_csv_text(text: str) -> str:
         out_lines.append("\t".join(cell.strip() for cell in row))
     return "\n".join(out_lines)
 
-
 # -------------------------------------------------------------------
 # Web ingest (used by worker)
 # -------------------------------------------------------------------
 def ingest_url_web(url: str, case: str | None):
-    _log_debug(f"ingest_url_web: START url={url!r}, case={case!r}")
+    _log_debug(f"ingest_url_web: START case={case!r}")
 
     headers = {
         "User-Agent": "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)",
@@ -476,15 +459,15 @@ def ingest_url_web(url: str, case: str | None):
             _guard_remote_url(final_url)
 
         ctype = (resp.headers.get("Content-Type") or "").lower()
-        _log_debug(f"ingest_url_web: GET ok url={final_url}, status={resp.status_code}, ctype={ctype}")
+        _log_debug(f"ingest_url_web: GET ok status={resp.status_code} ctype={ctype}")
 
     except HTTPError as e:
         status = getattr(e.response, "status_code", None)
         host = urlparse(url).hostname or ""
-        _log_debug(f"ingest_url_web: HTTPError status={status} url={url!r}: {e!r}")
+        _log_debug(f"ingest_url_web: HTTPError status={status} host={host!r}")
 
         if status == 403 and HEADLESS_ON_403 and headless_can_use_for(host):
-            _log_debug(f"ingest_url_web: attempting headless fetch for {url!r} host={host!r}")
+            _log_debug("ingest_url_web: attempting headless fetch on 403")
             final_url, html = headless_fetch_html(url)
             if final_url != url:
                 _guard_remote_url(final_url)
@@ -492,16 +475,13 @@ def ingest_url_web(url: str, case: str | None):
             soup = BeautifulSoup(html, "html.parser")
             text = soup.get_text("\n", strip=True)
             txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_html_headless")
-            try:
-                index_txt_document(str(txt_path))
-            except Exception as idx_e:
-                _log_debug(f"ingest_url_web: headless index failed {txt_path}: {idx_e!r}")
+            index_txt_document(str(txt_path))
             return None, txt_path
 
         raise RuntimeError(f"Network error fetching {url}: {e}") from e
 
     except Exception as e:
-        _log_debug(f"ingest_url_web: GET FAILED url={url}: {e!r}")
+        _log_debug(f"ingest_url_web: GET FAILED: {e!r}")
         raise RuntimeError(f"Network error fetching {url}: {e}") from e
 
     final_url = resp.url
@@ -536,7 +516,6 @@ def ingest_url_web(url: str, case: str | None):
 
     raise ValueError(f"Unsupported content type for ingest: {ctype or 'unknown'}")
 
-
 # -------------------------------------------------------------------
 # Manifest / display helpers
 # -------------------------------------------------------------------
@@ -552,34 +531,19 @@ def build_case_stats():
         key=lambda x: x[0],
     )
 
-
-def find_manifest_by_doc_id(doc_id: str):
-    for rec in iter_manifest() or []:
-        txt = rec.get("txt")
-        if not txt:
-            continue
-        p = Path(str(txt))
-        if p.stem == doc_id:
-            return rec
-    return None
-
-
 def load_ocr_text(path_str: str):
     try:
         p = Path(path_str)
         if not p.is_absolute():
             p = DATA_DIR / p
-
         if not p.exists():
             legacy = ROOT / "ocr" / p.name
             if legacy.exists():
                 p = legacy
-
         text = p.read_text(encoding="utf-8", errors="replace")
         return text, None
     except Exception as e:
         return None, str(e)
-
 
 def build_url_to_doc_id_map() -> dict[str, str]:
     mapping: dict[str, str] = {}
@@ -591,7 +555,6 @@ def build_url_to_doc_id_map() -> dict[str, str]:
         p = Path(str(txt))
         mapping.setdefault(str(src), p.stem)
     return mapping
-
 
 def iter_recent_docs(limit: int = 50):
     records = list(iter_manifest() or [])
@@ -627,15 +590,79 @@ def iter_recent_docs(limit: int = 50):
         )
     return docs
 
+# -------------------------------------------------------------------
+# Routes: auth
+# -------------------------------------------------------------------
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    next_url = _safe_next_url(request.args.get("next") or request.form.get("next") or "")
+    if _is_logged_in():
+        return redirect(next_url)
+
+    error = None
+    if request.method == "POST":
+        _require_csrf()
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+
+        if verify_user(username, password):
+            session.clear()
+            session["auth"] = "1"
+            session["user"] = username
+            session["csrf_token"] = os.urandom(16).hex()
+            session.permanent = True
+            return redirect(next_url)
+
+        error = "Invalid username or password."
+
+    csrf_token = _get_csrf_token()
+    return render_template("login.html", error=error, next=next_url, csrf_token=csrf_token)
+
+@app.route("/signup", methods=["GET", "POST"])
+def signup():
+    # If logged in already, don't allow casual account creation
+    if _is_logged_in():
+        return redirect(url_for("vault_search"))
+
+    error = None
+    if request.method == "POST":
+        _require_csrf()
+        invite = (request.form.get("invite") or "").strip()
+        username = (request.form.get("username") or "").strip()
+        password = request.form.get("password") or ""
+
+        try:
+            consume_invite(invite, username, password)
+            return redirect(url_for("login"))
+        except Exception as e:
+            error = str(e)
+
+    csrf_token = _get_csrf_token()
+    return render_template("signup.html", error=error, csrf_token=csrf_token)
+
+@app.route("/logout", methods=["POST"])
+@require_access
+def logout():
+    _require_csrf()
+    session.clear()
+    return redirect(url_for("login"))
 
 # -------------------------------------------------------------------
-# Routes
+# Routes: app
 # -------------------------------------------------------------------
+@app.route("/", methods=["GET"])
+def index_redirect():
+    if request.query_string:
+        return redirect(url_for("vault_search") + "?" + request.query_string.decode("utf-8"))
+    return redirect(url_for("vault_search"))
+
 @app.route("/web-ingest", methods=["GET", "POST"])
 @require_access
 def web_ingest():
-    active_nav = "web_ingest"
+    if request.method == "POST":
+        _require_csrf()
 
+    active_nav = "web_ingest"
     query: str = ""
     case: str = ""
     limit: int = 10
@@ -700,7 +727,6 @@ def web_ingest():
                         job_path = JOBS_QUEUE_DIR / job_name
                         payload = {"url": url, "case": case}
                         job_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-
                         item = {"url": url, "job_path": str(job_path), "error": None}
                     except Exception as e:
                         item = {"url": url, "job_path": None, "error": str(e)}
@@ -742,6 +768,7 @@ def web_ingest():
         _log_debug(f"web_ingest: failed to list queue jobs: {e!r}")
 
     url_to_doc_id = build_url_to_doc_id_map()
+    csrf_token = _get_csrf_token()
 
     return render_template(
         "web_ingest.html",
@@ -755,10 +782,11 @@ def web_ingest():
         ingested_by_url=ingested_by_url,
         queue_jobs=queue_jobs,
         url_to_doc_id=url_to_doc_id,
+        csrf_token=csrf_token,
     )
 
-
 @app.route("/cases", methods=["GET"])
+@require_access
 def cases_view():
     raw_stats = build_case_stats()
     cases = []
@@ -768,35 +796,70 @@ def cases_view():
         cases.append({"name": case_name, "doc_count": info.get("total", 0), "kinds": kinds_list})
     return render_template("cases.html", cases=cases, active_nav="cases")
 
-
 @app.route("/recent", methods=["GET"])
+@require_access
 def recent_view():
     docs = iter_recent_docs(limit=50)
     return render_template("recent.html", docs=docs, active_nav="recent")
 
-
 @app.route("/cases/<case_name>", methods=["GET"])
+@require_access
 def case_view(case_name: str):
+    def _domain(u: str) -> str:
+        try:
+            return (urlparse(u).netloc or "").lower()
+        except Exception:
+            return ""
+
     docs = []
-    for rec in iter_manifest() or []:
-        if (rec.get("case") or "uncategorized") != case_name:
+    for rec in (iter_manifest() or []):
+        rec_case = (rec.get("case") or "uncategorized")
+        if rec_case != case_name:
             continue
+
         txt = rec.get("txt")
-        if not txt:
-            continue
-        p = Path(str(txt))
+        pdf = rec.get("pdf")
+        source_url = rec.get("source_url")
+
+        doc_id = None
+        if txt:
+            try:
+                doc_id = Path(str(txt)).stem
+            except Exception:
+                doc_id = None
+        if not doc_id and pdf:
+            try:
+                doc_id = Path(str(pdf)).stem
+            except Exception:
+                doc_id = None
+        if not doc_id and source_url:
+            doc_id = (
+                source_url.replace("https://", "")
+                .replace("http://", "")
+                .replace("/", "_")
+                .replace("?", "_")
+                .replace("&", "_")
+                .replace("=", "_")
+                .replace("#", "_")
+            )[:120]
+
         docs.append(
             {
-                "doc_id": p.stem,
+                "doc_id": doc_id or "(unknown)",
+                "timestamp": rec.get("timestamp"),
                 "kind": rec.get("kind"),
-                "pdf": rec.get("pdf"),
-                "source_url": rec.get("source_url"),
+                "pdf": pdf,
+                "source_url": source_url,
+                "domain": _domain(source_url) if source_url else "",
+                "has_text": bool(txt),
             }
         )
+
+    docs.sort(key=lambda d: d.get("timestamp") or "", reverse=True)
     return render_template("case.html", case_name=case_name, docs=docs, active_nav="cases")
 
-
 @app.route("/doc/<doc_id>", methods=["GET"])
+@require_access
 def doc_view(doc_id: str):
     rec = find_manifest_by_doc_id(doc_id)
     if not rec:
@@ -817,41 +880,10 @@ def doc_view(doc_id: str):
         active_nav=None,
     )
 
-
-@app.route("/debug/whoami", methods=["GET"])
-def debug_whoami():
-    _require_debug_localhost_only()
-    xff = (request.headers.get("X-Forwarded-For") or "").strip()
-
-    return {
-        "client_ip": "127.0.0.1",
-        "remote_addr": request.remote_addr,
-        "x_remote_user": request.headers.get("X-Remote-User"),
-        "has_authorization_header": bool(request.headers.get("Authorization")),
-        "forwarded_for": xff,
-        "forwarded_proto": request.headers.get("X-Forwarded-Proto"),
-    }
-
-
-# -------------------------------------------------------------------
-# Search + index routes (NO DUPLICATES)
-# -------------------------------------------------------------------
-@app.route("/", methods=["GET"])
-def index_redirect():
-    """
-    Redirect / to /search while preserving querystring.
-    """
-    if request.query_string:
-        return redirect(url_for("vault_search") + "?" + request.query_string.decode("utf-8"))
-    return redirect(url_for("vault_search"))
-
-
 @app.route("/vault-search", methods=["GET", "POST"])
 @app.route("/search", methods=["GET", "POST"])
+@require_access
 def vault_search():
-    """
-    Search UI with pagination.
-    """
     query = (request.form.get("q") or request.form.get("query") or "").strip()
     if not query:
         query = (request.args.get("q") or request.args.get("query") or "").strip()
@@ -866,14 +898,8 @@ def vault_search():
     page = _clamp_int(request.args.get("page"), 1, 1, 10_000)
     per_page = _clamp_int(request.args.get("per_page"), 10, 5, 50)
 
-    _log_debug(
-        f"vault_search: method={request.method} q={query!r} "
-        f"page={page} per_page={per_page}"
-    )
-
     error = None
     results = []
-
     showing_from = 0
     showing_to = 0
     has_prev = False
@@ -886,13 +912,12 @@ def vault_search():
 
             start = (page - 1) * per_page
             end = start + per_page
-
             page_hits = raw_hits[start:end]
+
             results = [_decorate_hit(h) for h in page_hits]
 
             has_prev = page > 1
             has_next = len(raw_hits) > end
-
             if results:
                 showing_from = start + 1
                 showing_to = start + len(results)
@@ -914,26 +939,3 @@ def vault_search():
         showing_from=showing_from,
         showing_to=showing_to,
     )
-
-
-@app.route("/debug/search", methods=["GET"])
-def debug_search():
-    """
-    INTERNAL DEBUG ENDPOINT (localhost only)
-    """
-    _require_debug_localhost_only()
-
-    q = (request.args.get("q") or "").strip()
-    if not q:
-        return {"error": "missing q"}, 400
-
-    try:
-        hits = run_search(q, limit=5)
-        return {
-            "q": q,
-            "count": len(hits),
-            "hits": hits,
-        }
-    except Exception as e:
-        current_app.logger.exception("debug_search failed")
-        return {"q": q, "error": str(e)}, 500

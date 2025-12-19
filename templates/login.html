@@ -1,0 +1,26 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>Straightline Vault – Login</title>
+</head>
+<body>
+  <h1>Login</h1>
+
+  {% if error %}<p style="color:#b00">{{ error }}</p>{% endif %}
+
+  <form method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
+    <input type="hidden" name="next" value="{{ next }}" />
+
+    <label>Username <input name="username" autocomplete="username" required></label><br><br>
+    <label>Password <input name="password" type="password" autocomplete="current-password" required></label><br><br>
+
+    <button type="submit">Login</button>
+  </form>
+
+  <!-- only show this if/when you implement signup -->
+  <p><a href="{{ url_for('signup') }}">Create account</a></p> #}
+</body>
+</html>
