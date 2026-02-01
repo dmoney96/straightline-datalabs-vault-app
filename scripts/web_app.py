@@ -11,6 +11,7 @@ import json
 import time
 import logging
 import subprocess
+import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
@@ -22,9 +23,8 @@ import hmac
 
 # --- Third-party imports ---
 import requests
-from requests import HTTPError
+from requests.exceptions import HTTPError, RequestException
 from bs4 import BeautifulSoup
-
 from flask import (
     Flask,
     request,
@@ -56,7 +56,12 @@ if str(SCRIPTS_DIR) not in sys.path:
 # -------------------------------------------------------------------
 # Flask app (single instance)
 # -------------------------------------------------------------------
-app = Flask(__name__, template_folder=str(ROOT / "templates"))
+app = Flask(
+    __name__,
+    template_folder=str(ROOT / "templates"),
+    static_folder=str(ROOT / "static"),
+    static_url_path="/static",
+)
 
 # Require secret key (don’t silently run insecure in prod)
 secret_key = os.getenv("STRAIGHTLINE_SECRET_KEY")
@@ -69,12 +74,16 @@ app.secret_key = secret_key
 SESSION_MINUTES = int(os.getenv("STRAIGHTLINE_SESSION_MINUTES", "240"))  # default 4 hours
 app.config.update(
     SESSION_COOKIE_HTTPONLY=True,
-    SESSION_COOKIE_SECURE=True,  # requires HTTPS (nginx terminates TLS)
+    SESSION_COOKIE_SECURE=(os.getenv("STRAIGHTLINE_HTTPS", "1") == "1"),
     SESSION_COOKIE_SAMESITE="Lax",
     PERMANENT_SESSION_LIFETIME=timedelta(
         minutes=max(5, min(SESSION_MINUTES, 7 * 24 * 60))
     ),
 )
+
+if os.getenv("STRAIGHTLINE_DEBUG") == "1":
+    app.logger.info("DEBUG STRAIGHTLINE_HTTPS=%s", os.getenv("STRAIGHTLINE_HTTPS"))
+    app.logger.info("DEBUG SESSION_COOKIE_SECURE=%s", app.config.get("SESSION_COOKIE_SECURE"))
 
 # Optional CSRF enforcement (off by default)
 ENFORCE_CSRF = os.getenv("STRAIGHTLINE_CSRF", "0") == "1"
@@ -86,7 +95,7 @@ limiter = None
 try:
     from security_middleware import init_security  # type: ignore
     limiter = init_security(app)
-    logging.warning("Security middleware initialized successfully")
+    logging.info("Security middleware initialized successfully")
 except Exception as e:
     logging.error("Security middleware init failed: %r", e)
 
@@ -100,12 +109,19 @@ ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
 # -------------------------------------------------------------------
 from vault_core.search_providers import metasearch  # noqa: E402
 from vault_core.manifest import DATA_DIR, iter_manifest, append_manifest_entry  # noqa: E402
-from vault_core.search.indexer import run_search, update_index_for_file  # noqa: E402
+from vault_core.search_backend import run_search
+from vault_core.search_backend import index_txt_document as update_index_for_file
 
-from headless_fetch import headless_can_use_for, headless_fetch_html, HEADLESS_ON_403  # noqa: E402
+# Headless fetch helpers
+try:
+    from headless_fetch import headless_can_use_for, headless_fetch_html, headless_on_403  # type: ignore
+except ImportError:
+    from headless_fetch import headless_can_use_for, headless_fetch_html, HEADLESS_ON_403  # type: ignore
 
+    def headless_on_403() -> bool:
+        return bool(HEADLESS_ON_403)
 # Auth DB helper (SQLite)
-from vault_core.auth_db import consume_invite, verify_user  # noqa: E402
+from vault_core.auth_db import create_user, verify_user
 
 # Fallback OCR directory
 OCR_DIR = DATA_DIR / "ocr"
@@ -141,6 +157,10 @@ def _get_csrf_token() -> str:
         tok = os.urandom(16).hex()
         session["csrf_token"] = tok
     return str(tok)
+
+@app.context_processor
+def inject_csrf_token():
+    return {"csrf_token": _get_csrf_token()}
 
 def _require_csrf() -> None:
     if not ENFORCE_CSRF:
@@ -232,7 +252,7 @@ def _guard_remote_url(url: str) -> None:
             raise ValueError("non-public ip blocked")
 
 # -------------------------------------------------------------------
-# Search result presentation helpers (YOU WERE MISSING THESE)
+# Search result presentation helpers (WERE MISSING THESE)
 # -------------------------------------------------------------------
 def _humanize_doc_id(doc_id: str) -> str:
     s = doc_id.replace("_", " ").strip()
@@ -262,13 +282,30 @@ def _clip_snippet(snippet: str, max_chars: int = 420) -> str:
     return snippet[: max_chars - 1].rstrip() + "…"
 
 def find_manifest_by_doc_id(doc_id: str):
-    for rec in iter_manifest() or []:
+    doc_id = str(doc_id or "").strip()
+    if not doc_id:
+        return None
+
+    recs = list(iter_manifest() or [])
+    # 1) Prefer explicit manifest doc_id if present (new entries will have this)
+    for rec in recs:
+        try:
+            if str(rec.get("doc_id") or "").strip() == doc_id:
+                return rec
+        except Exception:
+            continue
+
+    # 2) Fallback: match by txt stem (legacy behavior)
+    for rec in recs:
         txt = rec.get("txt")
         if not txt:
             continue
-        p = Path(str(txt))
-        if p.stem == doc_id:
-            return rec
+        try:
+            if Path(str(txt)).stem == doc_id:
+                return rec
+        except Exception:
+            continue
+
     return None
 
 def _decorate_hit(hit: dict) -> dict:
@@ -281,10 +318,21 @@ def _decorate_hit(hit: dict) -> dict:
     kind = rec.get("kind") if isinstance(rec, dict) else None
     case = rec.get("case") if isinstance(rec, dict) else None
     ts = rec.get("timestamp") if isinstance(rec, dict) else None
+    pdf = rec.get("pdf") if isinstance(rec, dict) else None
+    txt = rec.get("txt") if isinstance(rec, dict) else None
+    meta = rec.get("metadata") if isinstance(rec, dict) else None
+    if not isinstance(meta, dict):
+        meta = {}
 
     domain = _domain_from_url(source_url) if source_url else ""
 
-    if source_url:
+    # Prefer explicit metadata title(s) over URL/filename
+    meta_title = (meta.get("title") or meta.get("page_title") or meta.get("search_title") or "")
+    meta_title = str(meta_title).strip()
+
+    if meta_title:
+        title = meta_title
+    elif source_url:
         title = source_url
     elif domain:
         title = domain
@@ -304,13 +352,54 @@ def _decorate_hit(hit: dict) -> dict:
         "kind": kind,
         "case": case,
         "timestamp": ts,
+        "pdf": pdf,
+        "txt": txt,
+        "metadata": meta,  # <-- NEW (templates can render this)
     }
-
 # -------------------------------------------------------------------
 # Index helpers
 # -------------------------------------------------------------------
 def index_txt_document(txt_path: str | Path) -> None:
     update_index_for_file(Path(txt_path))
+
+def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
+    h = hashlib.sha256()
+    with path.open("rb") as f:
+        for chunk in iter(lambda: f.read(chunk_size), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+def _make_web_metadata(resp: requests.Response, final_url: str, title_hint: str | None = None) -> dict:
+    ctype = (resp.headers.get("Content-Type") or "").strip()
+    clen = (resp.headers.get("Content-Length") or "").strip()
+    lastmod = (resp.headers.get("Last-Modified") or "").strip()
+
+    meta: dict[str, object] = {
+        "final_url": final_url,
+        "content_type": ctype,
+    }
+    if clen.isdigit():
+        meta["content_length"] = int(clen)
+    if lastmod:
+        meta["last_modified"] = lastmod
+
+    # If HTML, try to pull <title>
+    if "html" in ctype.lower():
+        try:
+            soup = BeautifulSoup(resp.text, "html.parser")
+            t = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+            if t:
+                meta["page_title"] = t[:300]
+        except Exception:
+            pass
+
+    if title_hint:
+        meta["search_title"] = title_hint[:300]
+
+    return meta
+# -------------------------------------------------------------------
+# PDF ingest
+# -------------------------------------------------------------------
 
 def _slug_from_url(url: str) -> str:
     parsed = urlparse(url)
@@ -318,12 +407,12 @@ def _slug_from_url(url: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
     return slug or "web_doc"
 
-# -------------------------------------------------------------------
-# PDF ingest
-# -------------------------------------------------------------------
-def ingest_source(url: str, case: str | None = None):
+def ingest_source(url: str, case: str | None = None, seed_meta: dict | None = None):
     _log_debug(f"ingest_source: START case={case!r}")
+
     _guard_remote_url(url)
+    seed_meta = seed_meta or {}
+    final_url = url
 
     pdf_root = DATA_DIR / "web_pdfs"
     pdf_root.mkdir(parents=True, exist_ok=True)
@@ -331,18 +420,50 @@ def ingest_source(url: str, case: str | None = None):
     slug = _slug_from_url(url)
     pdf_path = pdf_root / f"{slug}.pdf"
 
+    headers = {
+        "User-Agent": "Mozilla/5.0 (StraightlineVault/0.1; +non-malicious investigative use)",
+        "Accept": "*/*",
+    }
+
+    # -------------------------------
+    # Download PDF
+    # -------------------------------
     try:
-        resp = requests.get(url, stream=True, timeout=(10, 60))
+        resp = requests.get(
+            url,
+            headers=headers,
+            stream=True,
+            timeout=(10, 60),
+            allow_redirects=True,
+        )
         resp.raise_for_status()
+
+        final_url = resp.url or url
+        if final_url != url:
+            _guard_remote_url(final_url)
+
+        meta = {**seed_meta, **_make_web_metadata(resp, final_url)}
+        ctype = str(meta.get("content_type") or "").lower()
+        if "pdf" not in ctype:
+            meta["content_type"] = "application/pdf"
+
+        meta.setdefault("kind_hint", "pdf")
+
     except Exception as e:
         _log_debug(f"ingest_source: PDF download FAILED: {e!r}")
         raise RuntimeError(f"Failed to download PDF from {url}: {e}") from e
 
+    # -------------------------------
+    # Write PDF to disk
+    # -------------------------------
     with pdf_path.open("wb") as f:
         for chunk in resp.iter_content(chunk_size=8192):
             if chunk:
                 f.write(chunk)
 
+    # -------------------------------
+    # Convert PDF → TXT
+    # -------------------------------
     OCR_DIR.mkdir(parents=True, exist_ok=True)
     txt_path = OCR_DIR / f"{slug}.txt"
 
@@ -354,13 +475,24 @@ def ingest_source(url: str, case: str | None = None):
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        raise RuntimeError("pdftotext not found. Install poppler-utils (sudo apt install poppler-utils).")
+        raise RuntimeError("pdftotext not found. Install poppler-utils.")
     except subprocess.CalledProcessError as e:
         _log_debug(f"ingest_source: pdftotext FAILED for {pdf_path}: {e!r}")
         raise RuntimeError(f"pdftotext failed for {pdf_path}: {e}") from e
 
     if not txt_path.exists():
         raise RuntimeError(f"pdftotext did not produce TXT file at {txt_path}")
+
+    # ---- integrity hashes ----
+    try:
+        meta["sha256_pdf"] = _sha256_file(pdf_path)
+    except Exception:
+        pass
+
+    try:
+        meta["sha256_txt"] = _sha256_file(txt_path)
+    except Exception:
+        pass
 
     try:
         pdf_rel = pdf_path.relative_to(DATA_DIR)
@@ -371,13 +503,14 @@ def ingest_source(url: str, case: str | None = None):
         txt_rel = txt_path.relative_to(DATA_DIR)
     except ValueError:
         txt_rel = txt_path
-
-    entry: dict[str, object | None] = {
+    entry = {
+        "doc_id": slug,
         "kind": "web_pdf",
         "pdf": str(pdf_rel),
         "txt": str(txt_rel),
-        "source_url": url,
+        "source_url": final_url,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metadata": meta,
     }
     if case:
         entry["case"] = case
@@ -389,58 +522,69 @@ def ingest_source(url: str, case: str | None = None):
     except Exception as e:
         _log_debug(f"ingest_source: index_txt_document FAILED for {txt_path}: {e!r}")
 
+    # IMPORTANT: match ingest_url_web() return shape
     return pdf_path, txt_path
-
 # -------------------------------------------------------------------
 # Text/manifest helpers
 # -------------------------------------------------------------------
-def _write_txt_and_manifest(text: str, url: str, case: str | None, kind: str) -> Path:
+
+def _write_txt_and_manifest(
+    text: str,
+    url: str,
+    case: str | None,
+    kind: str,
+    metadata: dict | None = None,
+) -> Path:
     OCR_DIR.mkdir(parents=True, exist_ok=True)
     slug = _slug_from_url(url)
     txt_path = OCR_DIR / f"{slug}.txt"
     txt_path.write_text(text, encoding="utf-8", errors="replace")
 
+    if metadata is None:
+        metadata = {}
+    try:
+        metadata["sha256_txt"] = _sha256_file(txt_path)
+    except Exception:
+        pass
     try:
         txt_rel = txt_path.relative_to(DATA_DIR)
     except ValueError:
         txt_rel = txt_path
 
     entry: dict[str, object | None] = {
+        "doc_id": slug,
         "kind": kind,
         "pdf": None,
         "txt": str(txt_rel),
         "source_url": url,
         "timestamp": datetime.now(timezone.utc).isoformat(),
+        "metadata": metadata or {},
     }
+
     if case:
         entry["case"] = case
 
     append_manifest_entry(entry)
     return txt_path
 
-def _extract_docx_text(content: bytes) -> str:
+def _extract_docx_text(blob: bytes) -> str:
     if Document is None:
-        raise RuntimeError("python-docx not installed. pip install python-docx")
-    with io.BytesIO(content) as buf:
-        doc = Document(buf)
-    parts: list[str] = []
-    for para in doc.paragraphs:
-        t = para.text.strip()
-        if t:
-            parts.append(t)
-    return "\n".join(parts)
+        raise RuntimeError("python-docx not installed; cannot parse DOCX")
+    bio = io.BytesIO(blob)
+    doc = Document(bio)
+    return "\n".join(p.text for p in doc.paragraphs if p.text)
 
 def _extract_csv_text(text: str) -> str:
-    out_lines: list[str] = []
-    reader = csv.reader(text.splitlines())
+    out = []
+    reader = csv.reader(io.StringIO(text))
     for row in reader:
-        out_lines.append("\t".join(cell.strip() for cell in row))
-    return "\n".join(out_lines)
+        out.append("\t".join(cell.strip() for cell in row))
+    return "\n".join(out)
 
 # -------------------------------------------------------------------
 # Web ingest (used by worker)
 # -------------------------------------------------------------------
-def ingest_url_web(url: str, case: str | None):
+def ingest_url_web(url: str, case: str | None, seed_meta: dict | None = None):
     _log_debug(f"ingest_url_web: START case={case!r}")
 
     headers = {
@@ -466,7 +610,7 @@ def ingest_url_web(url: str, case: str | None):
         host = urlparse(url).hostname or ""
         _log_debug(f"ingest_url_web: HTTPError status={status} host={host!r}")
 
-        if status == 403 and HEADLESS_ON_403 and headless_can_use_for(host):
+        if status == 403 and headless_on_403() and headless_can_use_for(host):
             _log_debug("ingest_url_web: attempting headless fetch on 403")
             final_url, html = headless_fetch_html(url)
             if final_url != url:
@@ -474,7 +618,59 @@ def ingest_url_web(url: str, case: str | None):
 
             soup = BeautifulSoup(html, "html.parser")
             text = soup.get_text("\n", strip=True)
-            txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_html_headless")
+
+            meta = {
+                "final_url": final_url,
+                "content_type": "text/html (headless)",
+            }
+            t = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+            if t:
+                meta["page_title"] = t[:300]
+                meta["title"] = t[:300]
+
+            txt_path = _write_txt_and_manifest(
+                text,
+                final_url,
+                case,
+                kind="web_html_headless",
+                metadata=meta,
+            )
+            index_txt_document(str(txt_path))
+            return None, txt_path
+
+        raise RuntimeError(f"Network error fetching {url}: {e}") from e
+
+    except RequestException as e:
+        host = urlparse(url).hostname or ""
+        _log_debug(f"ingest_url_web: RequestException host={host!r} err={e!r}")
+
+        # Optional headless fallback on network-ish failures too
+        if headless_on_403() and headless_can_use_for(host):
+            _log_debug("ingest_url_web: attempting headless fetch on RequestException")
+            final_url, html = headless_fetch_html(url)
+            if final_url != url:
+                _guard_remote_url(final_url)
+
+            soup = BeautifulSoup(html, "html.parser")
+            text = soup.get_text("\n", strip=True)
+
+            meta = {
+                "final_url": final_url,
+                "content_type": "text/html (headless)",
+                "headless_fallback_reason": f"RequestException: {type(e).__name__}",
+            }
+            t = (soup.title.string or "").strip() if soup.title and soup.title.string else ""
+            if t:
+                meta["page_title"] = t[:300]
+                meta["title"] = t[:300]
+
+            txt_path = _write_txt_and_manifest(
+                text,
+                final_url,
+                case,
+                kind="web_html_headless",
+                metadata=meta,
+            )
             index_txt_document(str(txt_path))
             return None, txt_path
 
@@ -484,38 +680,47 @@ def ingest_url_web(url: str, case: str | None):
         _log_debug(f"ingest_url_web: GET FAILED: {e!r}")
         raise RuntimeError(f"Network error fetching {url}: {e}") from e
 
+    # -------------------------------
+    # Normal (non-headless) handling
+    # -------------------------------
     final_url = resp.url
     ctype = (resp.headers.get("Content-Type") or "").lower()
 
     if "pdf" in ctype or final_url.lower().endswith(".pdf"):
-        return ingest_source(final_url, case=case)
+        return ingest_source(final_url, case=case, seed_meta=seed_meta)
 
     if "officedocument.wordprocessingml.document" in ctype or final_url.lower().endswith(".docx"):
         text = _extract_docx_text(resp.content)
-        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_docx")
+        meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
+        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_docx", metadata=meta)
         index_txt_document(str(txt_path))
         return None, txt_path
 
     if "text/csv" in ctype or final_url.lower().endswith(".csv"):
         text = _extract_csv_text(resp.text)
-        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_csv")
+        meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
+        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_csv", metadata=meta)
         index_txt_document(str(txt_path))
         return None, txt_path
 
     if "html" in ctype or final_url.lower().endswith((".htm", ".html", "/")):
         soup = BeautifulSoup(resp.text, "html.parser")
         text = soup.get_text("\n", strip=True)
-        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_html")
+        meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
+        # mirror common "title" key for UI convenience
+        if isinstance(meta, dict) and meta.get("page_title") and not meta.get("title"):
+            meta["title"] = meta["page_title"]
+        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_html", metadata=meta)
         index_txt_document(str(txt_path))
         return None, txt_path
 
     if ctype.startswith("text/"):
-        txt_path = _write_txt_and_manifest(resp.text, final_url, case, kind="web_text")
+        meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
+        txt_path = _write_txt_and_manifest(resp.text, final_url, case, kind="web_text", metadata=meta)
         index_txt_document(str(txt_path))
         return None, txt_path
 
     raise ValueError(f"Unsupported content type for ingest: {ctype or 'unknown'}")
-
 # -------------------------------------------------------------------
 # Manifest / display helpers
 # -------------------------------------------------------------------
@@ -544,16 +749,27 @@ def load_ocr_text(path_str: str):
         return text, None
     except Exception as e:
         return None, str(e)
-
+    
+    
 def build_url_to_doc_id_map() -> dict[str, str]:
     mapping: dict[str, str] = {}
-    for rec in iter_manifest() or []:
+
+    for rec in (iter_manifest() or []):
         src = rec.get("source_url")
         txt = rec.get("txt")
         if not src or not txt:
             continue
-        p = Path(str(txt))
-        mapping.setdefault(str(src), p.stem)
+
+        doc_id = str(rec.get("doc_id") or "").strip()
+
+        if not doc_id:
+            try:
+                doc_id = Path(str(txt)).stem
+            except Exception:
+                continue
+
+        mapping.setdefault(str(src), doc_id)
+
     return mapping
 
 def iter_recent_docs(limit: int = 50):
@@ -578,16 +794,25 @@ def iter_recent_docs(limit: int = 50):
         txt = rec.get("txt")
         if not txt:
             continue
-        p = Path(str(txt))
+
+        # Prefer canonical manifest doc_id
+        doc_id = (str(rec.get("doc_id") or "")).strip()
+        if not doc_id:
+            # legacy fallback
+            try:
+               doc_id = Path(str(txt)).stem
+            except Exception:
+               doc_id = "(unknown)"
+
         docs.append(
             {
-                "doc_id": p.stem,
+                "doc_id": doc_id,
                 "timestamp": rec.get("timestamp") or "",
                 "case": rec.get("case"),
                 "kind": rec.get("kind"),
                 "source_url": rec.get("source_url"),
             }
-        )
+        ) 
     return docs
 
 # -------------------------------------------------------------------
@@ -620,19 +845,18 @@ def login():
 
 @app.route("/signup", methods=["GET", "POST"])
 def signup():
-    # If logged in already, don't allow casual account creation
     if _is_logged_in():
         return redirect(url_for("vault_search"))
 
     error = None
+
     if request.method == "POST":
         _require_csrf()
-        invite = (request.form.get("invite") or "").strip()
         username = (request.form.get("username") or "").strip()
         password = request.form.get("password") or ""
 
         try:
-            consume_invite(invite, username, password)
+            create_user(username, password)
             return redirect(url_for("login"))
         except Exception as e:
             error = str(e)
@@ -659,6 +883,21 @@ def index_redirect():
 @app.route("/web-ingest", methods=["GET", "POST"])
 @require_access
 def web_ingest():
+    def _parse_urls_block(text: str) -> list[str]:
+        out: list[str] = []
+        seen: set[str] = set()
+        for raw in (text or "").splitlines():
+            s = raw.strip()
+            if not s or s.startswith("#"):
+                continue
+            if not (s.startswith("http://") or s.startswith("https://")):
+                continue
+            if s in seen:
+                continue
+            seen.add(s)
+            out.append(s)
+        return out
+
     if request.method == "POST":
         _require_csrf()
 
@@ -667,6 +906,8 @@ def web_ingest():
     case: str = ""
     limit: int = 10
     error: str | None = None
+    urls: str = ""
+    mode: str = "search"
 
     search_results: list[dict] = []
     ingested: list[dict] = []
@@ -676,63 +917,96 @@ def web_ingest():
         query = (request.form.get("query") or "").strip()
         case = (request.form.get("case") or "").strip()
         limit_raw = (request.form.get("limit") or "").strip()
+        urls = (request.form.get("urls") or "").strip()
 
+        url_list = _parse_urls_block(urls)
+        mode = "urls" if url_list else "search"
+
+        # ---- limit clamp ----
         try:
             limit = int(limit_raw) if limit_raw else 10
         except ValueError:
             error = "Limit must be an integer."
             limit = 10
-
         limit = max(1, min(limit, 20))
 
-        if not query and not error:
-            error = "Query is required."
+        # ---- validation ----
+        if not query and not url_list and not error:
+            error = "Enter a Query or paste one or more URLs (http/https), one per line."
 
-        if not error:
-            if not case:
+        # ---- case defaulting ----
+        if not error and not case:
+            if query:
                 slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
                 case = f"{slug}_web" if slug else "web"
+            else:
+                case = "web"
 
-            try:
-                raw_results = metasearch(query, max_results=limit)
-            except Exception as e:
-                current_app.logger.exception("web_ingest: metasearch error")
-                error = f"Metasearch error: {e}"
-                raw_results = []
+        # ---- build search_results ----
+        if not error:
+            if mode == "urls":
+                for u in url_list[:limit]:
+                    search_results.append(
+                        {"title": "", "url": u, "snippet": "", "engine": "manual"}
+                    )
+            else:
+                try:
+                    raw_results = metasearch(query, max_results=limit)
+                except Exception as e:
+                    current_app.logger.exception("web_ingest: metasearch error")
+                    error = f"Metasearch error: {e}"
+                    raw_results = []
 
-            for r in raw_results:
-                title = (r.get("title") if isinstance(r, dict) else getattr(r, "title", "")) or ""
-                url = (r.get("url") if isinstance(r, dict) else getattr(r, "url", "")) or ""
-                snippet = (r.get("snippet") if isinstance(r, dict) else getattr(r, "snippet", "")) or ""
-                engine = (r.get("engine") if isinstance(r, dict) else getattr(r, "engine", "")) or ""
-                if not url:
-                    continue
-                search_results.append({"title": title, "url": url, "snippet": snippet, "engine": engine})
+                if not error:
+                    for r in raw_results:
+                        title = (r.get("title") if isinstance(r, dict) else getattr(r, "title", "")) or ""
+                        url = (r.get("url") if isinstance(r, dict) else getattr(r, "url", "")) or ""
+                        snippet = (r.get("snippet") if isinstance(r, dict) else getattr(r, "snippet", "")) or ""
+                        engine = (r.get("engine") if isinstance(r, dict) else getattr(r, "engine", "")) or ""
+                        if not url:
+                            continue
+                        search_results.append(
+                            {"title": title, "url": url, "snippet": snippet, "engine": engine}
+                        )
 
-            if not error and not search_results:
-                error = "No results returned from metasearch."
+                if not error and not search_results:
+                    error = "No results returned from metasearch."
 
-            if not error:
-                JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
-                JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
-                JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+        # ---- queue jobs ----
+        if not error:
+            JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
+            JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
+            JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
-                for hit in search_results:
-                    url = hit["url"]
-                    try:
-                        ts = int(time.time() * 1000)
-                        pid = os.getpid()
-                        safe_case = re.sub(r"[^a-z0-9]+", "_", (case or "web").lower()).strip("_")
-                        job_name = f"{ts}-{pid}-{safe_case}.json"
-                        job_path = JOBS_QUEUE_DIR / job_name
-                        payload = {"url": url, "case": case}
-                        job_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
-                        item = {"url": url, "job_path": str(job_path), "error": None}
-                    except Exception as e:
-                        item = {"url": url, "job_path": None, "error": str(e)}
-                    ingested.append(item)
-                    ingested_by_url[url] = item
+            for hit in search_results:
+                url = hit["url"]
+                try:
+                    ts = int(time.time() * 1000)
+                    pid = os.getpid()
+                    safe_case = re.sub(r"[^a-z0-9]+", "_", (case or "web").lower()).strip("_")
+                    job_name = f"{ts}-{pid}-{safe_case}.json"
+                    job_path = JOBS_QUEUE_DIR / job_name
+                    payload = {
+                        "url": url,
+                        "case": case,
+                        "seed_meta": {
+                             "search_title": (hit.get("title") or "").strip(),
+                             "search_snippet": (hit.get("snippet") or "").strip(),
+                             "engine": (hit.get("engine") or "").strip(),
+                        },
+                    }
+                    
+                    job_path.write_text(
+                        json.dumps(payload, ensure_ascii=False),
+                        encoding="utf-8",
+                    )
+                    item = {"url": url, "job_path": str(job_path), "error": None}
+                except Exception as e:
+                    item = {"url": url, "job_path": None, "error": str(e)}
+                ingested.append(item)
+                ingested_by_url[url] = item
 
+    # ---- show queued jobs on the page (always) ----
     queue_jobs: list[dict] = []
     try:
         JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
@@ -747,6 +1021,7 @@ def web_ingest():
                         ts_ms = int(parts[0])
                     except Exception:
                         ts_ms = None
+
                 queued_at = ""
                 if ts_ms is not None:
                     try:
@@ -763,7 +1038,9 @@ def web_ingest():
                 except Exception:
                     pass
 
-                queue_jobs.append({"name": name, "url": url, "case": case_field, "queued_at": queued_at})
+                queue_jobs.append(
+                    {"name": name, "url": url, "case": case_field, "queued_at": queued_at}
+                )
     except Exception as e:
         _log_debug(f"web_ingest: failed to list queue jobs: {e!r}")
 
@@ -774,6 +1051,7 @@ def web_ingest():
         "web_ingest.html",
         active_nav=active_nav,
         query=query,
+        urls=urls,
         case=case,
         limit=limit,
         error=error,
@@ -821,8 +1099,8 @@ def case_view(case_name: str):
         pdf = rec.get("pdf")
         source_url = rec.get("source_url")
 
-        doc_id = None
-        if txt:
+        doc_id = (str(rec.get("doc_id") or "")).strip() or None
+        if not doc_id and txt:
             try:
                 doc_id = Path(str(txt)).stem
             except Exception:
@@ -916,6 +1194,28 @@ def vault_search():
 
             results = [_decorate_hit(h) for h in page_hits]
 
+            # TEMP SAFETY NET: remove after confirming _decorate_hit() always hydrates correctly
+            if os.getenv("STRAIGHTLINE_HYDRATE_FALLBACK", "1") == "1":
+                for r in results:
+                    doc_id = r.get("doc_id")
+                    if not doc_id:
+                        continue
+      
+                    rec = find_manifest_by_doc_id(doc_id)
+                    if not rec:
+                        continue
+
+                    meta = r.get("metadata")
+                    if not isinstance(meta, dict) or not meta:
+                        rec_meta = rec.get("metadata")
+                        r["metadata"] = rec_meta if isinstance(rec_meta, dict) else {}
+
+                    r.setdefault("case", rec.get("case"))
+                    r.setdefault("kind", rec.get("kind"))
+                    r.setdefault("source_url", rec.get("source_url"))
+                    r.setdefault("pdf", rec.get("pdf"))
+                    r.setdefault("txt", rec.get("txt"))
+
             has_prev = page > 1
             has_next = len(raw_hits) > end
             if results:
@@ -939,3 +1239,7 @@ def vault_search():
         showing_from=showing_from,
         showing_to=showing_to,
     )
+
+
+
+
