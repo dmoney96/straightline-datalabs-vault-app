@@ -103,7 +103,14 @@ except Exception as e:
 # Access token (optional; used for internal CLI/API access)
 # -------------------------------------------------------------------
 ACCESS_TOKEN = os.getenv("STRAIGHTLINE_ACCESS_TOKEN") or ""
-
+# -------------------------------------------------------------------
+# Jobs / ingestion queue paths (used by web UI + job worker)
+# -------------------------------------------------------------------
+JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
+JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
+JOBS_PROCESSING_DIR = JOBS_ROOT / "processing"
+JOBS_DONE_DIR = JOBS_ROOT / "done"
+JOBS_FAILED_DIR = JOBS_ROOT / "failed"
 # -------------------------------------------------------------------
 # Internal Straightline Vault imports
 # -------------------------------------------------------------------
@@ -913,6 +920,10 @@ def web_ingest():
     ingested: list[dict] = []
     ingested_by_url: dict[str, dict] = {}
 
+    # Ensure these exist even on GET
+    limit_raw: str = ""
+    url_list: list[str] = []
+
     if request.method == "POST":
         query = (request.form.get("query") or "").strip()
         case = (request.form.get("case") or "").strip()
@@ -922,95 +933,102 @@ def web_ingest():
         url_list = _parse_urls_block(urls)
         mode = "urls" if url_list else "search"
 
-        # ---- limit clamp ----
-        try:
-            limit = int(limit_raw) if limit_raw else 10
-        except ValueError:
-            error = "Limit must be an integer."
-            limit = 10
-        limit = max(1, min(limit, 20))
+    # ---- limit parse (no clamp) ----
+    MAX_WEB_INGEST = int(os.getenv("STRAIGHTLINE_WEB_INGEST_MAX", "2000"))
+    try:
+        limit = int(limit_raw) if limit_raw else 10
+    except ValueError:
+        error = "Limit must be an integer."
+        limit = 10
 
-        # ---- validation ----
-        if not query and not url_list and not error:
-            error = "Enter a Query or paste one or more URLs (http/https), one per line."
+    # reject invalid ranges (validation, not clamping)
+    if request.method == "POST" and not error:
+        if limit < 1:
+            error = "Limit must be >= 1."
+        elif limit > MAX_WEB_INGEST:
+            error = f"Limit exceeds server max ({MAX_WEB_INGEST})."
 
-        # ---- case defaulting ----
-        if not error and not case:
-            if query:
-                slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
-                case = f"{slug}_web" if slug else "web"
-            else:
-                case = "web"
+    # ---- validation ----
+    if request.method == "POST" and (not query and not url_list) and not error:
+        error = "Enter a Query or paste one or more URLs (http/https), one per line."
 
-        # ---- build search_results ----
-        if not error:
-            if mode == "urls":
-                for u in url_list[:limit]:
+    # ---- case defaulting ----
+    if not error and not case:
+        if query:
+            slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
+            case = f"{slug}_web" if slug else "web"
+        else:
+            case = "web"
+
+    # ---- build search_results ----
+    if not error:
+        if mode == "urls":
+            for u in url_list[:limit]:
+                search_results.append(
+                    {"title": "", "url": u, "snippet": "", "engine": "manual"}
+                )
+        else:
+            try:
+                raw_results = metasearch(query, max_results=limit)
+            except Exception as e:
+                current_app.logger.exception("web_ingest: metasearch error")
+                error = f"Metasearch error: {e}"
+                raw_results = []
+
+            if not error:
+                for r in raw_results:
+                    title = (r.get("title") if isinstance(r, dict) else getattr(r, "title", "")) or ""
+                    url = (r.get("url") if isinstance(r, dict) else getattr(r, "url", "")) or ""
+                    snippet = (r.get("snippet") if isinstance(r, dict) else getattr(r, "snippet", "")) or ""
+                    engine = (r.get("engine") if isinstance(r, dict) else getattr(r, "engine", "")) or ""
+
+                    if not url:
+                        continue
+
                     search_results.append(
-                        {"title": "", "url": u, "snippet": "", "engine": "manual"}
+                        {"title": title, "url": url, "snippet": snippet, "engine": engine}
                     )
-            else:
-                try:
-                    raw_results = metasearch(query, max_results=limit)
-                except Exception as e:
-                    current_app.logger.exception("web_ingest: metasearch error")
-                    error = f"Metasearch error: {e}"
-                    raw_results = []
 
-                if not error:
-                    for r in raw_results:
-                        title = (r.get("title") if isinstance(r, dict) else getattr(r, "title", "")) or ""
-                        url = (r.get("url") if isinstance(r, dict) else getattr(r, "url", "")) or ""
-                        snippet = (r.get("snippet") if isinstance(r, dict) else getattr(r, "snippet", "")) or ""
-                        engine = (r.get("engine") if isinstance(r, dict) else getattr(r, "engine", "")) or ""
-                        if not url:
-                            continue
-                        search_results.append(
-                            {"title": title, "url": url, "snippet": snippet, "engine": engine}
-                        )
-
-                if not error and not search_results:
+                if not search_results:
                     error = "No results returned from metasearch."
 
-        # ---- queue jobs ----
-        if not error:
-            JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
-            JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
-            JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+    # ---- queue jobs ----
+    if not error:
+        JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
 
-            for hit in search_results:
-                url = hit["url"]
-                try:
-                    ts = int(time.time() * 1000)
-                    pid = os.getpid()
-                    safe_case = re.sub(r"[^a-z0-9]+", "_", (case or "web").lower()).strip("_")
-                    job_name = f"{ts}-{pid}-{safe_case}.json"
-                    job_path = JOBS_QUEUE_DIR / job_name
-                    payload = {
-                        "url": url,
-                        "case": case,
-                        "seed_meta": {
-                             "search_title": (hit.get("title") or "").strip(),
-                             "search_snippet": (hit.get("snippet") or "").strip(),
-                             "engine": (hit.get("engine") or "").strip(),
-                        },
-                    }
-                    
-                    job_path.write_text(
-                        json.dumps(payload, ensure_ascii=False),
-                        encoding="utf-8",
-                    )
-                    item = {"url": url, "job_path": str(job_path), "error": None}
-                except Exception as e:
-                    item = {"url": url, "job_path": None, "error": str(e)}
-                ingested.append(item)
-                ingested_by_url[url] = item
+        for hit in search_results:
+            url = hit["url"]
+            try:
+                ts = int(time.time() * 1000)
+                pid = os.getpid()
+                safe_case = re.sub(r"[^a-z0-9]+", "_", (case or "web").lower()).strip("_")
+                job_name = f"{ts}-{pid}-{safe_case}.json"
+                job_path = JOBS_QUEUE_DIR / job_name
+
+                payload = {
+                    "url": url,
+                    "case": case,
+                    "seed_meta": {
+                        "search_title": (hit.get("title") or "").strip(),
+                        "search_snippet": (hit.get("snippet") or "").strip(),
+                        "engine": (hit.get("engine") or "").strip(),
+                    },
+                }
+
+                job_path.write_text(
+                    json.dumps(payload, ensure_ascii=False),
+                    encoding="utf-8",
+                )
+                item = {"url": url, "job_path": str(job_path), "error": None}
+            except Exception as e:
+                item = {"url": url, "job_path": None, "error": str(e)}
+
+            ingested.append(item)
+            ingested_by_url[url] = item
 
     # ---- show queued jobs on the page (always) ----
     queue_jobs: list[dict] = []
     try:
-        JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
-        JOBS_QUEUE_DIR = JOBS_ROOT / "queue"
         if JOBS_QUEUE_DIR.exists():
             for p in sorted(JOBS_QUEUE_DIR.glob("*.json")):
                 name = p.name
@@ -1158,6 +1176,35 @@ def doc_view(doc_id: str):
         active_nav=None,
     )
 
+# -------------------------------------------------------------------
+# Routes: document view
+# -------------------------------------------------------------------
+@app.route("/doc/<doc_id>", methods=["GET"])
+@require_access
+def doc_view(doc_id: str):
+    rec = find_manifest_by_doc_id(doc_id)
+    if not rec:
+        abort(404, description=f"No manifest record found for doc_id={doc_id!r}")
+
+    txt_path = rec.get("txt")
+    content, err = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing")
+
+    return render_template(
+        "doc.html",
+        doc_id=doc_id,
+        case_name=rec.get("case"),
+        kind=rec.get("kind"),
+        pdf=rec.get("pdf"),
+        source_url=rec.get("source_url"),
+        content=content,
+        error=err,
+        active_nav=None,
+    )
+
+
+# -------------------------------------------------------------------
+# Routes: search
+# -------------------------------------------------------------------
 @app.route("/vault-search", methods=["GET", "POST"])
 @app.route("/search", methods=["GET", "POST"])
 @require_access
@@ -1166,24 +1213,47 @@ def vault_search():
     if not query:
         query = (request.args.get("q") or request.args.get("query") or "").strip()
 
-    def _clamp_int(val, default, lo, hi):
-        try:
-            n = int(val)
-        except Exception:
-            n = default
-        return max(lo, min(hi, n))
-
-    page = _clamp_int(request.args.get("page"), 1, 1, 10_000)
-    per_page = _clamp_int(request.args.get("per_page"), 10, 5, 50)
-
+    # ---- init outputs (ALWAYS before parsing/validation) ----
     error = None
-    results = []
+    results: list[dict] = []
     showing_from = 0
     showing_to = 0
     has_prev = False
     has_next = False
 
-    if query:
+    # ---- page/per_page parse (no clamp) ----
+    MAX_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PAGE_MAX", "10000"))
+    MAX_PER_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PER_PAGE_MAX", "50"))
+    MIN_PER_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PER_PAGE_MIN", "5"))
+
+    page_raw = (request.args.get("page") or "").strip()
+    per_page_raw = (request.args.get("per_page") or "").strip()
+
+    page = 1
+    per_page = 10
+
+    # Parse ints (validation, not clamping)
+    try:
+        if page_raw:
+            page = int(page_raw)
+        if per_page_raw:
+            per_page = int(per_page_raw)
+    except ValueError:
+        error = "page and per_page must be integers."
+
+    # Range validation
+    if not error:
+        if page < 1:
+            error = "page must be >= 1."
+        elif page > MAX_PAGE:
+            error = f"page exceeds server max ({MAX_PAGE})."
+        elif per_page < MIN_PER_PAGE:
+            error = f"per_page must be >= {MIN_PER_PAGE}."
+        elif per_page > MAX_PER_PAGE:
+            error = f"per_page exceeds server max ({MAX_PER_PAGE})."
+
+    # ---- run search ----
+    if query and not error:
         try:
             fetch_limit = page * per_page
             raw_hits = run_search(query, limit=fetch_limit)
@@ -1200,7 +1270,7 @@ def vault_search():
                     doc_id = r.get("doc_id")
                     if not doc_id:
                         continue
-      
+
                     rec = find_manifest_by_doc_id(doc_id)
                     if not rec:
                         continue
@@ -1241,5 +1311,12 @@ def vault_search():
     )
 
 
-
-
+# -------------------------------------------------------------------
+# Local dev entrypoint (optional)
+# -------------------------------------------------------------------
+if __name__ == "__main__":
+    # Don’t run debug unless explicitly enabled
+    debug = os.getenv("STRAIGHTLINE_DEBUG") == "1"
+    host = os.getenv("STRAIGHTLINE_HOST", "127.0.0.1")
+    port = int(os.getenv("STRAIGHTLINE_PORT", "5000"))
+    app.run(host=host, port=port, debug=debug)
