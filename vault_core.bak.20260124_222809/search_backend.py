@@ -8,7 +8,7 @@ from whoosh import index, qparser, scoring, query as q, highlight
 from whoosh.analysis import StandardAnalyzer, NgramFilter
 from whoosh.fields import Schema, ID, KEYWORD, TEXT
 
-from vault_core.paths import DATA_DIR, INDEX_DIR
+from vault_core.paths import DATA_DIR
 from vault_core.manifest import iter_manifest
 
 import re
@@ -46,6 +46,9 @@ def normalize_query(q: str) -> str:
     q_norm = WHITESPACE_RE.sub(" ", q_norm)
 
     return q_norm.strip()
+
+# Index lives under DATA_DIR/index
+INDEX_DIR = DATA_DIR / "index"
 
 # Analyzer: normal tokenization + 3-15 char n-grams for partial matches
 content_analyzer = StandardAnalyzer() | NgramFilter(minsize=3, maxsize=15)
@@ -136,8 +139,8 @@ def index_txt_document(txt_path: str) -> None:
     try:
         writer.update_document(
             doc_id=doc_id,
-            case=(meta.get("case") or "uncategorized").lower(),
-            kind=(meta.get("kind") or "unknown").lower(),
+            case=(meta.get("case") or "").lower(),
+            kind=(meta.get("kind") or "").lower(),
             source=meta.get("source") or "",
             content=text,
         )
@@ -171,7 +174,7 @@ def run_search(
         weighting=scoring.BM25F(field_B={"content": 0.75}, K1=1.5)
     ) as searcher:
         parser = qparser.MultifieldParser(
-            ["content", "doc_id", "source", "case", "kind"],
+            ["content", "doc_id", "source"],
             schema=ix.schema,
             group=qparser.OrGroup.factory(0.9),
         )

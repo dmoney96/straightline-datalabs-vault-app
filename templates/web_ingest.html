@@ -51,11 +51,24 @@
           id="query"
           name="query"
           type="text"
-          required
           autocomplete="off"
           value="{{ query or '' }}"
           placeholder="e.g. &quot;Maxwell 1320 docket pdf&quot; or &quot;Trump MRI abdomen pdf&quot;"
         >
+      </div>
+
+      <div class="field-row">
+        <label for="urls">URLs (one per line)</label>
+        <textarea
+          id="urls"
+          name="urls"
+          rows="6"
+          style="width:100%;"
+          placeholder="https://example.com/doc.pdf"
+        >{{ urls or '' }}</textarea>
+        <div class="meta-soft" style="margin-top:0.25rem;">
+          Tip: If you fill URLs, the Query field can be empty.
+        </div>
       </div>
 
       <div class="field-row">
@@ -102,11 +115,24 @@
 <section class="card card--subtle" style="margin-top:1.25rem;">
 
   <div class="card-header">
-    <h3 style="margin:0; font-size:0.98rem;">Metasearch results</h3>
+    <h3 style="margin:0; font-size:0.98rem;">
+      {% if mode|default('search') == 'urls' %}
+        URL ingest queue
+      {% else %}
+        Metasearch results
+      {% endif %}
+    </h3>
+
     <p class="meta-soft" style="margin:0;">
       {{ search_results|length }} hit{{ search_results|length != 1 and "s" or "" }}
-      for <code>{{ query }}</code>{% if case %} &nbsp;·&nbsp; queued under case
-      <code>{{ case }}</code>{% endif %}.
+      {% if mode|default('search') == 'urls' %}
+        from pasted URLs
+      {% else %}
+        for <code>{{ query }}</code>
+      {% endif %}
+      {% if case %}
+        &nbsp;·&nbsp; queued under case <code>{{ case }}</code>
+      {% endif %}.
     </p>
   </div>
 
@@ -122,11 +148,11 @@
       <tbody>
         {% for r in search_results %}
           {% set ingest = ingested_by_url.get(r.url) if ingested_by_url is defined else None %}
-          {% set local_id = url_to_doc_id.get(r.url) if url_to_doc_id is defined else None %}
+          {% set suggests = url_to_doc_id.get(r.url) if url_to_doc_id is defined else None %}
           <tr>
             <td>
-              {% if local_id %}
-                <a href="{{ url_for('doc_view', doc_id=local_id) }}">
+              {% if suggests %}
+                <a href="{{ url_for('doc_view', doc_id=suggests) }}">
                   {{ r.title or r.url }}
                 </a>
                 <div class="meta-soft" style="margin-top:0.2rem;">
@@ -151,9 +177,7 @@
 
             <td>
               {% if r.snippet %}
-                <div class="meta-soft">
-                  {{ r.snippet }}
-                </div>
+                <div class="meta-soft">{{ r.snippet }}</div>
               {% else %}
                 <span class="meta-soft">No snippet provided.</span>
               {% endif %}

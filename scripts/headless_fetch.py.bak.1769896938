@@ -1,0 +1,108 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import os
+from contextlib import contextmanager
+from typing import Tuple, Optional
+
+# Feature flags from environment
+HEADLESS_ENABLED = os.getenv("HEADLESS_FETCH_ENABLED", "0") == "1"
+HEADLESS_ON_403 = os.getenv("HEADLESS_FETCH_ON_403", "1") == "1"
+
+_allowed = os.getenv("HEADLESS_ALLOWED_DOMAINS", "") or ""
+HEADLESS_ALLOWED_DOMAINS = {d.strip().lower() for d in _allowed.split(",") if d.strip()}
+
+# Browser choice: chromium is usually best for “anti-bot” weirdness; firefox is okay.
+HEADLESS_BROWSER = (os.getenv("HEADLESS_BROWSER", "chromium") or "chromium").strip().lower()
+
+# Timeouts / waits
+DEFAULT_TIMEOUT_MS = int(os.getenv("HEADLESS_TIMEOUT_MS", "30000"))
+WAIT_UNTIL = (os.getenv("HEADLESS_WAIT_UNTIL", "domcontentloaded") or "domcontentloaded").strip()
+
+# Optional: set a realistic UA to avoid immediate blocks on some sites.
+DEFAULT_UA = os.getenv(
+    "HEADLESS_USER_AGENT",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
+)
+
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore[import]
+    _PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    _PLAYWRIGHT_AVAILABLE = False
+
+
+def headless_can_use_for(host: str) -> bool:
+    """
+    Return True if we are allowed to do a headless fetch for this host.
+
+    Conditions:
+      - HEADLESS_FETCH_ENABLED=1
+      - Playwright successfully imported
+      - host matches HEADLESS_ALLOWED_DOMAINS (exact or subdomain).
+    """
+    if not HEADLESS_ENABLED or not _PLAYWRIGHT_AVAILABLE:
+        return False
+
+    host = (host or "").lower().strip()
+    if not host:
+        return False
+
+    # Be paranoid: if no allowlist is configured, do not run headless.
+    if not HEADLESS_ALLOWED_DOMAINS:
+        return False
+
+    return any(host == d or host.endswith("." + d) for d in HEADLESS_ALLOWED_DOMAINS)
+
+
+@contextmanager
+def _playwright_browser():
+    with sync_playwright() as p:
+        if HEADLESS_BROWSER == "firefox":
+            browser = p.firefox.launch(headless=True)
+        elif HEADLESS_BROWSER == "webkit":
+            browser = p.webkit.launch(headless=True)
+        else:
+            browser = p.chromium.launch(headless=True)
+
+        try:
+            yield browser
+        finally:
+            browser.close()
+
+
+def headless_fetch_html(url: str, timeout_ms: Optional[int] = None) -> Tuple[str, str]:
+    """
+    Fetch (final_url, html_text) using Playwright headless.
+
+    Notes:
+      - This is not “bypass security,” it’s “render JS + get DOM.”
+      - Your caller (web_app) already does allowlisting + SSRF guard.
+    """
+    if not _PLAYWRIGHT_AVAILABLE:
+        raise RuntimeError("Playwright is not installed in this environment.")
+
+    timeout_ms = int(timeout_ms or DEFAULT_TIMEOUT_MS)
+
+    with _playwright_browser() as browser:
+        ctx = browser.new_context(user_agent=DEFAULT_UA)
+        page = ctx.new_page()
+
+        # If the site is heavy, networkidle can hang forever; domcontentloaded is safer.
+        page.goto(url, timeout=timeout_ms, wait_until=WAIT_UNTIL)
+
+        # Best-effort small settle time so you don’t ingest half-rendered DOM.
+        try:
+            page.wait_for_timeout(750)
+        except Exception:
+            pass
+
+        html = page.content()
+        final_url = page.url
+
+        try:
+            ctx.close()
+        except Exception:
+            pass
+
+        return final_url, html

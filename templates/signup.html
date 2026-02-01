@@ -4,21 +4,42 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Straightline Vault – Create Account</title>
+
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/auth.css') }}">
 </head>
-<body>
-  <h1>Create account</h1>
 
-  {% if error %}<p style="color:#b00">{{ error }}</p>{% endif %}
-  {% if ok %}<p style="color:#090">{{ ok }}</p>{% endif %}
+<body class="auth-page">
+  <div class="auth-card">
+    <h1>Create account</h1>
 
-  <form method="post" action="{{ url_for('signup') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-    <label>Invite code <input name="invite" required></label><br><br>
-    <label>Username <input name="username" autocomplete="username" required></label><br><br>
-    <label>Password <input name="password" type="password" autocomplete="new-password" required></label><br><br>
-    <button type="submit">Create account</button>
-  </form>
+    {% if error %}
+      <div class="auth-msg error">{{ error }}</div>
+    {% endif %}
+    {% if ok %}
+      <div class="auth-msg ok">{{ ok }}</div>
+    {% endif %}
 
-  <p><a href="{{ url_for('login') }}">Back to login</a></p>
+    <form method="post" action="{{ url_for('signup') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+
+      <div class="auth-field">
+        <label for="username">Username</label>
+        <input id="username" name="username" autocomplete="username" required>
+      </div>
+
+      <div class="auth-field">
+        <label for="password">Password</label>
+        <input id="password" name="password" type="password" autocomplete="new-password" required>
+      </div>
+
+      <div class="auth-actions">
+        <button type="submit">Create account</button>
+      </div>
+    </form>
+
+    <p style="margin-top: 16px;">
+      <a href="{{ url_for('login') }}">Back to login</a>
+    </p>
+  </div>
 </body>
 </html>

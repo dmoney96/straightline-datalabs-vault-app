@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import json
+import os
 import time
 from pathlib import Path
 
@@ -9,11 +10,17 @@ from pathlib import Path
 # directory, so a plain "import web_app" correctly loads scripts/web_app.py.
 import web_app  # type: ignore[import]
 
-# Reuse paths + helpers from the Flask app so everything stays in sync
+# Reuse helpers from the Flask app so ingest behavior stays in sync
 ingest_url_web = web_app.ingest_url_web
-_log_debug = web_app._log_debug
-JOBS_ROOT = web_app.JOBS_ROOT
-JOBS_QUEUE_DIR = web_app.JOBS_QUEUE_DIR
+_log_debug = getattr(web_app, "_log_debug", print)
+
+import os
+
+# Define jobs root locally (do NOT depend on web_app.JOBS_ROOT existing)
+JOBS_ROOT = Path(os.getenv("STRAIGHTLINE_JOBS_DIR", "/opt/straightline-vault/jobs"))
+
+# Prefer web_app.JOBS_QUEUE_DIR if present; otherwise derive from JOBS_ROOT
+JOBS_QUEUE_DIR = getattr(web_app, "JOBS_QUEUE_DIR", JOBS_ROOT / "queue")
 
 # Worker-local directories, parallel to queue/
 JOBS_PROCESSING_DIR = JOBS_ROOT / "processing"

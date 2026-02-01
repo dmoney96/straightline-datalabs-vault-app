@@ -1,0 +1,86 @@
+/* static/css/auth.css */
+/* Straightline Vault – Auth pages */
+
+.auth-page {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  padding: 24px;
+  background: #fafafa;
+}
+
+.auth-card {
+  width: 100%;
+  max-width: 420px;
+  padding: 24px;
+  border: 1px solid #ddd;
+  border-radius: 12px;
+  background: #fff;
+}
+
+.auth-card h1 {
+  margin: 0 0 16px 0;
+  font-size: 1.4rem;
+}
+
+.auth-field {
+  margin-bottom: 14px;
+}
+
+.auth-field label {
+  display: block;
+  margin-bottom: 6px;
+  font-weight: 500;
+}
+
+.auth-field input {
+  width: 100%;
+  padding: 10px 12px;
+  box-sizing: border-box;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  font-size: 1rem;
+}
+
+.auth-field input:focus {
+  outline: none;
+  border-color: #666;
+}
+
+.auth-actions {
+  margin-top: 16px;
+}
+
+.auth-actions button {
+  width: 100%;
+  padding: 10px 12px;
+  font-size: 1rem;
+  border-radius: 8px;
+  border: 1px solid #333;
+  background: #333;
+  color: #fff;
+  cursor: pointer;
+}
+
+.auth-actions button:hover {
+  background: #000;
+}
+
+.auth-msg {
+  margin-bottom: 12px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  border: 1px solid transparent;
+  font-size: 0.95rem;
+}
+
+.auth-msg.error {
+  border-color: #f0b4b4;
+  background: #fff5f5;
+}
+
+.auth-msg.ok {
+  border-color: #b7e3b7;
+  background: #f4fff4;
+}

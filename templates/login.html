@@ -4,23 +4,53 @@
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Straightline Vault – Login</title>
+
+  <!-- Auth styles -->
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/auth.css') }}">
 </head>
-<body>
-  <h1>Login</h1>
+<body class="auth-page">
 
-  {% if error %}<p style="color:#b00">{{ error }}</p>{% endif %}
+  <div class="auth-card">
+    <h1>Login</h1>
 
-  <form method="post" action="{{ url_for('login') }}">
-    <input type="hidden" name="csrf_token" value="{{ csrf_token }}" />
-    <input type="hidden" name="next" value="{{ next }}" />
+    {% if error %}
+      <div class="auth-msg error">{{ error }}</div>
+    {% endif %}
 
-    <label>Username <input name="username" autocomplete="username" required></label><br><br>
-    <label>Password <input name="password" type="password" autocomplete="current-password" required></label><br><br>
+    <form method="post" action="{{ url_for('login') }}">
+      <input type="hidden" name="csrf_token" value="{{ csrf_token }}">
+      <input type="hidden" name="next" value="{{ next }}">
 
-    <button type="submit">Login</button>
-  </form>
+      <div class="auth-field">
+        <label for="username">Username</label>
+        <input
+          id="username"
+          name="username"
+          autocomplete="username"
+          required
+        >
+      </div>
 
-  <!-- only show this if/when you implement signup -->
-  <p><a href="{{ url_for('signup') }}">Create account</a></p> #}
+      <div class="auth-field">
+        <label for="password">Password</label>
+        <input
+          id="password"
+          name="password"
+          type="password"
+          autocomplete="current-password"
+          required
+        >
+      </div>
+
+      <div class="auth-actions">
+        <button type="submit">Login</button>
+      </div>
+    </form>
+
+    <p style="margin-top: 16px;">
+      <a href="{{ url_for('signup') }}">Create account</a>
+    </p>
+  </div>
+
 </body>
 </html>

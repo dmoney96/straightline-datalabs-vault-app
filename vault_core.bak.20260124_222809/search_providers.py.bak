@@ -1,0 +1,320 @@
+#!/usr/bin/env python
+from __future__ import annotations
+
+import os
+import logging
+from dataclasses import dataclass
+from typing import List, Optional, Dict, Any
+
+import requests
+
+logger = logging.getLogger(__name__)
+
+
+# ---------- Data model ----------
+
+@dataclass
+class SearchResult:
+    provider: str
+    query: str
+    title: str
+    url: str
+    snippet: str
+    rank: int
+    raw: Dict[str, Any]
+
+
+# ---------- Base class ----------
+
+class BaseSearchProvider:
+    name: str = "base"
+
+    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
+        raise NotImplementedError
+
+
+# ---------- Helper: env-get with multiple aliases ----------
+
+def _get_first_env(*names: str) -> Optional[str]:
+    """
+    Return the first non-empty environment variable among the given names.
+    """
+    for n in names:
+        v = os.getenv(n)
+        if v:
+            logger.debug("Using env %s for API key / config", n)
+            return v
+    return None
+
+
+# ---------- Brave Search Provider ----------
+
+class BraveSearchProvider(BaseSearchProvider):
+    """
+    Uses Brave Search API.
+    Docs: https://api.search.brave.com/app/documentation
+    """
+    name = "brave"
+
+    def __init__(self, api_key: Optional[str] = None):
+        # Accept several possible env names to avoid mismatch
+        self.api_key = api_key or _get_first_env(
+            "BRAVE_SEARCH_API_KEY",
+            "BRAVE_API_KEY",
+            "BRAVE_TOKEN",
+        )
+
+        if not self.api_key:
+            raise RuntimeError(
+                "Brave provider not available: no API key found in "
+                "BRAVE_SEARCH_API_KEY / BRAVE_API_KEY / BRAVE_TOKEN"
+            )
+
+        # Default endpoint for web search
+        self.endpoint = "https://api.search.brave.com/res/v1/web/search"
+
+    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
+        logger.info("[Brave] search q=%r max_results=%d", query, max_results)
+
+        params = {
+            "q": query,
+            "count": max_results,
+        }
+        headers = {
+            "Accept": "application/json",
+            "X-Subscription-Token": self.api_key,
+        }
+
+        resp = requests.get(self.endpoint, params=params, headers=headers, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        web_results = data.get("web", {}).get("results", []) or []
+        results: List[SearchResult] = []
+
+        for idx, item in enumerate(web_results[:max_results], start=1):
+            results.append(
+                SearchResult(
+                    provider=self.name,
+                    query=query,
+                    title=item.get("title", ""),
+                    url=item.get("url", ""),
+                    snippet=item.get("description", "") or item.get("snippet", ""),
+                    rank=idx,
+                    raw=item,
+                )
+            )
+
+        logger.info("[Brave] returned %d result(s)", len(results))
+        return results
+
+
+# ---------- Google Programmable Search Provider ----------
+
+class GoogleCSEProvider(BaseSearchProvider):
+    """
+    Uses Google Custom/Programmable Search JSON API.
+    Docs: https://developers.google.com/custom-search/v1/overview
+    """
+    name = "google_cse"
+
+    def __init__(
+        self,
+        api_key: Optional[str] = None,
+        cse_id: Optional[str] = None,
+    ):
+        # Accept a few possible names for the same thing
+        self.api_key = api_key or _get_first_env(
+            "GOOGLE_API_KEY",
+            "GOOGLE_SEARCH_API_KEY",
+        )
+        self.cse_id = cse_id or _get_first_env(
+            "GOOGLE_CSE_ID",
+            "GOOGLE_CX",
+        )
+
+        if not self.api_key or not self.cse_id:
+            raise RuntimeError(
+                "Google CSE provider not available: missing GOOGLE_API_KEY / "
+                "GOOGLE_SEARCH_API_KEY or GOOGLE_CSE_ID / GOOGLE_CX"
+            )
+
+        self.endpoint = "https://www.googleapis.com/customsearch/v1"
+
+    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
+        logger.info("[GoogleCSE] search q=%r max_results=%d", query, max_results)
+
+        params = {
+            "key": self.api_key,
+            "cx": self.cse_id,
+            "q": query,
+            "num": min(max_results, 10),  # Google's max per request is 10
+        }
+
+        resp = requests.get(self.endpoint, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        items = data.get("items", []) or []
+        results: List[SearchResult] = []
+
+        for idx, item in enumerate(items[:max_results], start=1):
+            results.append(
+                SearchResult(
+                    provider=self.name,
+                    query=query,
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", ""),
+                    rank=idx,
+                    raw=item,
+                )
+            )
+
+        logger.info("[GoogleCSE] returned %d result(s)", len(results))
+        return results
+
+
+# ---------- SerpAPI Provider (optional) ----------
+
+class SerpAPIProvider(BaseSearchProvider):
+    """
+    Uses SerpAPI's Google search.
+    Docs: https://serpapi.com/search-api
+    """
+    name = "serpapi"
+
+    def __init__(self, api_key: Optional[str] = None):
+        self.api_key = api_key or _get_first_env(
+            "SERPAPI_KEY",
+            "SERP_API_KEY",
+        )
+
+        if not self.api_key:
+            raise RuntimeError(
+                "SerpAPI provider not available: no key in SERPAPI_KEY / SERP_API_KEY"
+            )
+
+        self.endpoint = "https://serpapi.com/search"
+
+    def search(self, query: str, max_results: int = 10) -> List[SearchResult]:
+        logger.info("[SerpAPI] search q=%r max_results=%d", query, max_results)
+
+        params = {
+            "engine": "google",
+            "q": query,
+            "api_key": self.api_key,
+            "num": max_results,
+        }
+
+        resp = requests.get(self.endpoint, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+
+        organic = data.get("organic_results", []) or []
+        results: List[SearchResult] = []
+
+        for idx, item in enumerate(organic[:max_results], start=1):
+            results.append(
+                SearchResult(
+                    provider=self.name,
+                    query=query,
+                    title=item.get("title", ""),
+                    url=item.get("link", ""),
+                    snippet=item.get("snippet", "") or item.get("snippet_highlighted_words", ""),
+                    rank=idx,
+                    raw=item,
+                )
+            )
+
+        logger.info("[SerpAPI] returned %d result(s)", len(results))
+        return results
+
+
+# ---------- Metasearch ----------
+
+def metasearch(
+    query: str,
+    max_results: int = 20,
+    providers: Optional[List[BaseSearchProvider]] = None,
+) -> List[SearchResult]:
+    """
+    Run a query across multiple providers and return a merged, de-duplicated list.
+    De-dupe is by URL; first occurrence wins.
+    """
+    logger.info("metasearch: q=%r max_results=%d", query, max_results)
+
+    if providers is None:
+        providers = []
+        errors: Dict[str, str] = {}
+
+        # Brave is your default general web engine
+        try:
+            providers.append(BraveSearchProvider())
+            logger.info("BraveSearchProvider enabled")
+        except Exception as e:
+            msg = str(e)
+            logger.warning("Brave provider not available: %s", msg)
+            errors["brave"] = msg
+
+        # Google CSE is optional but recommended once configured
+        try:
+            providers.append(GoogleCSEProvider())
+            logger.info("GoogleCSEProvider enabled")
+        except Exception as e:
+            msg = str(e)
+            logger.warning("Google CSE provider not available: %s", msg)
+            errors["google_cse"] = msg
+
+        # SerpAPI optional
+        try:
+            providers.append(SerpAPIProvider())
+            logger.info("SerpAPIProvider enabled")
+        except Exception as e:
+            msg = str(e)
+            logger.warning("SerpAPI provider not available: %s", msg)
+            errors["serpapi"] = msg
+
+        if not providers:
+            # Bubble up a clear message (this is what web_ingest catches)
+            raise RuntimeError(
+                "No search providers configured. "
+                f"Errors: {errors}"
+            )
+
+    seen_urls = set()
+    merged: List[SearchResult] = []
+
+    # crude split: at least 5 per provider, or evenly-ish
+    per_provider_target = max(5, max_results // max(1, len(providers)))
+
+    for provider in providers:
+        try:
+            results = provider.search(query, max_results=per_provider_target)
+        except Exception as e:
+            logger.error("Error from provider %s: %s", provider.name, e)
+            continue
+
+        for res in results:
+            if not res.url:
+                continue
+            if res.url in seen_urls:
+                continue
+            seen_urls.add(res.url)
+            merged.append(res)
+
+            if len(merged) >= max_results:
+                break
+
+        if len(merged) >= max_results:
+            break
+
+    logger.info("metasearch: merged %d result(s)", len(merged))
+    return merged
+
+
+if __name__ == "__main__":
+    logging.basicConfig(level=logging.INFO)
+    q = "jeffrey epstein court documents"
+    for r in metasearch(q, max_results=10):
+        print(f"[{r.provider}] {r.title} -> {r.url}")
