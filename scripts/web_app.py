@@ -15,8 +15,8 @@ import hashlib
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from collections import defaultdict
-from urllib.parse import urlparse
 from functools import wraps
+from urllib.parse import urlparse, urlunparse
 import ipaddress
 import socket
 import hmac
@@ -34,6 +34,8 @@ from flask import (
     redirect,
     url_for,
     session,
+    send_file,
+    jsonify,
 )
 
 # --- Optional DOCX parsing ---
@@ -89,6 +91,34 @@ if os.getenv("STRAIGHTLINE_DEBUG") == "1":
 ENFORCE_CSRF = os.getenv("STRAIGHTLINE_CSRF", "0") == "1"
 
 # -------------------------------------------------------------------
+# Web ingest tuning (policy comes from environment)
+# -------------------------------------------------------------------
+MAX_WEB_INGEST = int(os.getenv("STRAIGHTLINE_WEB_INGEST_MAX", "5000"))
+DEFAULT_WEB_INGEST = int(os.getenv("STRAIGHTLINE_WEB_INGEST_DEFAULT", "200"))
+DEFAULT_WEB_INGEST = max(1, min(DEFAULT_WEB_INGEST, MAX_WEB_INGEST))
+
+print("WEB_INGEST POLICY:", DEFAULT_WEB_INGEST, MAX_WEB_INGEST)
+
+@app.get("/__debug_search")
+def __debug_search():
+    import os
+    import vault_core.search_backend as sb
+    from whoosh import index as whoosh_index
+
+    out = []
+    out.append(f"ENV STRAIGHTLINE_INDEX_DIR={os.getenv('STRAIGHTLINE_INDEX_DIR')}")
+    out.append(f"search_backend.INDEX_DIR={getattr(sb, 'INDEX_DIR', None)}")
+    out.append(f"search_backend.schema.fields={list(sb.schema.names())}")
+
+    try:
+        ix = whoosh_index.open_dir(str(sb.INDEX_DIR))
+        out.append(f"on_disk_index.schema.fields={list(ix.schema.names())}")
+    except Exception as e:
+        out.append(f"open_dir FAILED: {e!r}")
+
+    return "<pre>" + "\n".join(out) + "</pre>"
+
+# -------------------------------------------------------------------
 # Security middleware (optional but should not break app boot)
 # -------------------------------------------------------------------
 limiter = None
@@ -116,8 +146,8 @@ JOBS_FAILED_DIR = JOBS_ROOT / "failed"
 # -------------------------------------------------------------------
 from vault_core.search_providers import metasearch  # noqa: E402
 from vault_core.manifest import DATA_DIR, iter_manifest, append_manifest_entry  # noqa: E402
-from vault_core.search_backend import run_search
-from vault_core.search_backend import index_txt_document as update_index_for_file
+from vault_core.search.indexer import run_search
+from vault_core.search_backend import index_txt_document as backend_index_txt_document
 
 # Headless fetch helpers
 try:
@@ -132,6 +162,7 @@ from vault_core.auth_db import create_user, verify_user
 
 # Fallback OCR directory
 OCR_DIR = DATA_DIR / "ocr"
+HTML_DIR = DATA_DIR / "web_html"
 
 # -------------------------------------------------------------------
 # Logging helpers
@@ -146,13 +177,14 @@ def _log_debug(msg: str) -> None:
 # -------------------------------------------------------------------
 @app.after_request
 def _add_security_headers(resp):
-    resp.headers.setdefault("X-Content-Type-Options", "nosniff")
-    resp.headers.setdefault("X-Frame-Options", "DENY")
-    resp.headers.setdefault("Referrer-Policy", "no-referrer")
-    resp.headers.setdefault(
-        "Content-Security-Policy",
-        "default-src 'self'; frame-ancestors 'none'; base-uri 'self'",
+    resp.headers["X-Content-Type-Options"] = "nosniff"
+    resp.headers["X-Frame-Options"] = "DENY"
+    resp.headers["Referrer-Policy"] = "no-referrer"
+    resp.headers["Content-Security-Policy"] = (
+        "default-src 'self'; frame-ancestors 'none'; base-uri 'self'"
     )
+    resp.headers["Cache-Control"] = "no-store"
+    resp.headers["Pragma"] = "no-cache"
     return resp
 
 # -------------------------------------------------------------------
@@ -259,7 +291,7 @@ def _guard_remote_url(url: str) -> None:
             raise ValueError("non-public ip blocked")
 
 # -------------------------------------------------------------------
-# Search result presentation helpers (WERE MISSING THESE)
+# Search result presentation helpers (THESE ARE MAKING ME HATE MY LIFE)
 # -------------------------------------------------------------------
 def _humanize_doc_id(doc_id: str) -> str:
     s = doc_id.replace("_", " ").strip()
@@ -272,6 +304,35 @@ def _domain_from_url(url: str) -> str:
         return host or ""
     except Exception:
         return ""
+
+def _normalize_url(u: str) -> str:
+    """
+    Normalize URLs for de-dupe:
+    - strip whitespace
+    - drop fragments (#)
+    - remove default ports (:80, :443)
+    - normalize scheme/host casing
+    - keep query (important) and path (important)
+    """
+    u = (u or "").strip()
+    if not u:
+        return ""
+
+    p = urlparse(u)
+    scheme = (p.scheme or "").lower()
+    host = (p.hostname or "").lower()
+
+    # Preserve explicit port only if non-default
+    port = p.port
+    netloc = host
+    if port and not ((scheme == "http" and port == 80) or (scheme == "https" and port == 443)):
+        netloc = f"{host}:{port}"
+
+    # Keep path as-is (case may matter on some servers)
+    path = p.path or ""
+    query = p.query or ""
+
+    return urlunparse((scheme, netloc, path, "", query, ""))
 
 def _summarize_path(path_str: str) -> str:
     try:
@@ -327,6 +388,7 @@ def _decorate_hit(hit: dict) -> dict:
     ts = rec.get("timestamp") if isinstance(rec, dict) else None
     pdf = rec.get("pdf") if isinstance(rec, dict) else None
     txt = rec.get("txt") if isinstance(rec, dict) else None
+    html = rec.get("html") if isinstance(rec, dict) else None
     meta = rec.get("metadata") if isinstance(rec, dict) else None
     if not isinstance(meta, dict):
         meta = {}
@@ -361,13 +423,14 @@ def _decorate_hit(hit: dict) -> dict:
         "timestamp": ts,
         "pdf": pdf,
         "txt": txt,
+        "html": html,
         "metadata": meta,  # <-- NEW (templates can render this)
     }
 # -------------------------------------------------------------------
 # Index helpers
 # -------------------------------------------------------------------
 def index_txt_document(txt_path: str | Path) -> None:
-    update_index_for_file(Path(txt_path))
+    backend_index_txt_document(Path(txt_path))
 
 def _sha256_file(path: Path, chunk_size: int = 1024 * 1024) -> str:
     h = hashlib.sha256()
@@ -411,6 +474,10 @@ def _make_web_metadata(resp: requests.Response, final_url: str, title_hint: str 
 def _slug_from_url(url: str) -> str:
     parsed = urlparse(url)
     base = (parsed.netloc + parsed.path).lower()
+
+    if parsed.query:
+        base += "_" + parsed.query.lower()
+
     slug = re.sub(r"[^a-z0-9]+", "_", base).strip("_")
     return slug or "web_doc"
 
@@ -534,13 +601,13 @@ def ingest_source(url: str, case: str | None = None, seed_meta: dict | None = No
 # -------------------------------------------------------------------
 # Text/manifest helpers
 # -------------------------------------------------------------------
-
 def _write_txt_and_manifest(
     text: str,
     url: str,
     case: str | None,
     kind: str,
     metadata: dict | None = None,
+    extra_fields: dict | None = None,
 ) -> Path:
     OCR_DIR.mkdir(parents=True, exist_ok=True)
     slug = _slug_from_url(url)
@@ -549,10 +616,12 @@ def _write_txt_and_manifest(
 
     if metadata is None:
         metadata = {}
+
     try:
         metadata["sha256_txt"] = _sha256_file(txt_path)
     except Exception:
         pass
+
     try:
         txt_rel = txt_path.relative_to(DATA_DIR)
     except ValueError:
@@ -571,8 +640,20 @@ def _write_txt_and_manifest(
     if case:
         entry["case"] = case
 
+    if extra_fields:
+        entry.update(extra_fields)
+
     append_manifest_entry(entry)
     return txt_path
+
+
+def _write_html_snapshot(url: str, html_text: str) -> Path:
+    HTML_DIR.mkdir(parents=True, exist_ok=True)
+    slug = _slug_from_url(url)
+    html_path = HTML_DIR / f"{slug}.html"
+    html_path.write_text(html_text, encoding="utf-8", errors="replace")
+    return html_path
+
 
 def _extract_docx_text(blob: bytes) -> str:
     if Document is None:
@@ -581,13 +662,13 @@ def _extract_docx_text(blob: bytes) -> str:
     doc = Document(bio)
     return "\n".join(p.text for p in doc.paragraphs if p.text)
 
+
 def _extract_csv_text(text: str) -> str:
     out = []
     reader = csv.reader(io.StringIO(text))
     for row in reader:
         out.append("\t".join(cell.strip() for cell in row))
     return "\n".join(out)
-
 # -------------------------------------------------------------------
 # Web ingest (used by worker)
 # -------------------------------------------------------------------
@@ -635,13 +716,22 @@ def ingest_url_web(url: str, case: str | None, seed_meta: dict | None = None):
                 meta["page_title"] = t[:300]
                 meta["title"] = t[:300]
 
+            html_path = _write_html_snapshot(final_url, html)
+
+            try:
+                html_rel = html_path.relative_to(DATA_DIR)
+            except ValueError:
+                html_rel = html_path
+
             txt_path = _write_txt_and_manifest(
                 text,
                 final_url,
                 case,
                 kind="web_html_headless",
                 metadata=meta,
+                extra_fields={"html": str(html_rel)},
             )
+
             index_txt_document(str(txt_path))
             return None, txt_path
 
@@ -651,7 +741,6 @@ def ingest_url_web(url: str, case: str | None, seed_meta: dict | None = None):
         host = urlparse(url).hostname or ""
         _log_debug(f"ingest_url_web: RequestException host={host!r} err={e!r}")
 
-        # Optional headless fallback on network-ish failures too
         if headless_on_403() and headless_can_use_for(host):
             _log_debug("ingest_url_web: attempting headless fetch on RequestException")
             final_url, html = headless_fetch_html(url)
@@ -671,13 +760,22 @@ def ingest_url_web(url: str, case: str | None, seed_meta: dict | None = None):
                 meta["page_title"] = t[:300]
                 meta["title"] = t[:300]
 
+            html_path = _write_html_snapshot(final_url, html)
+
+            try:
+                html_rel = html_path.relative_to(DATA_DIR)
+            except ValueError:
+                html_rel = html_path
+
             txt_path = _write_txt_and_manifest(
                 text,
                 final_url,
                 case,
                 kind="web_html_headless",
                 metadata=meta,
+                extra_fields={"html": str(html_rel)},
             )
+
             index_txt_document(str(txt_path))
             return None, txt_path
 
@@ -699,31 +797,66 @@ def ingest_url_web(url: str, case: str | None, seed_meta: dict | None = None):
     if "officedocument.wordprocessingml.document" in ctype or final_url.lower().endswith(".docx"):
         text = _extract_docx_text(resp.content)
         meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
-        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_docx", metadata=meta)
+        txt_path = _write_txt_and_manifest(
+            text,
+            final_url,
+            case,
+            kind="web_docx",
+            metadata=meta,
+        )
         index_txt_document(str(txt_path))
         return None, txt_path
 
     if "text/csv" in ctype or final_url.lower().endswith(".csv"):
         text = _extract_csv_text(resp.text)
         meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
-        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_csv", metadata=meta)
+        txt_path = _write_txt_and_manifest(
+            text,
+            final_url,
+            case,
+            kind="web_csv",
+            metadata=meta,
+        )
         index_txt_document(str(txt_path))
         return None, txt_path
 
     if "html" in ctype or final_url.lower().endswith((".htm", ".html", "/")):
-        soup = BeautifulSoup(resp.text, "html.parser")
+        raw_html = resp.text
+        soup = BeautifulSoup(raw_html, "html.parser")
         text = soup.get_text("\n", strip=True)
         meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
-        # mirror common "title" key for UI convenience
+
         if isinstance(meta, dict) and meta.get("page_title") and not meta.get("title"):
             meta["title"] = meta["page_title"]
-        txt_path = _write_txt_and_manifest(text, final_url, case, kind="web_html", metadata=meta)
+
+        html_path = _write_html_snapshot(final_url, raw_html)
+
+        try:
+            html_rel = html_path.relative_to(DATA_DIR)
+        except ValueError:
+            html_rel = html_path
+
+        txt_path = _write_txt_and_manifest(
+            text,
+            final_url,
+            case,
+            kind="web_html",
+            metadata=meta,
+            extra_fields={"html": str(html_rel)},
+        )
+
         index_txt_document(str(txt_path))
         return None, txt_path
 
     if ctype.startswith("text/"):
         meta = {**(seed_meta or {}), **_make_web_metadata(resp, final_url)}
-        txt_path = _write_txt_and_manifest(resp.text, final_url, case, kind="web_text", metadata=meta)
+        txt_path = _write_txt_and_manifest(
+            resp.text,
+            final_url,
+            case,
+            kind="web_text",
+            metadata=meta,
+        )
         index_txt_document(str(txt_path))
         return None, txt_path
 
@@ -779,6 +912,18 @@ def build_url_to_doc_id_map() -> dict[str, str]:
 
     return mapping
 
+def build_url_to_doc_record_map() -> dict[str, dict]:
+    mapping: dict[str, dict] = {}
+
+    for rec in (iter_manifest() or []):
+        src = rec.get("source_url")
+        if not src:
+            continue
+
+        mapping.setdefault(str(src), rec)
+
+    return mapping
+
 def iter_recent_docs(limit: int = 50):
     records = list(iter_manifest() or [])
 
@@ -818,9 +963,42 @@ def iter_recent_docs(limit: int = 50):
                 "case": rec.get("case"),
                 "kind": rec.get("kind"),
                 "source_url": rec.get("source_url"),
+                "pdf": rec.get("pdf"),
+                "html": rec.get("html"),
+                "has_text": bool(txt),
+                "metadata": rec.get("metadata") or {},
             }
-        ) 
+        )
     return docs
+
+@app.get("/__debug/index")
+@require_access
+def debug_index():
+    out = {}
+
+    # What the web app sees
+    out["env_INDEX_DIR"] = os.getenv("STRAIGHTLINE_INDEX_DIR")
+    out["env_DATA_DIR"] = os.getenv("STRAIGHTLINE_DATA_DIR")
+
+    # What search_backend thinks
+    try:
+        from vault_core import search_backend as sb
+        out["search_backend.INDEX_DIR"] = str(getattr(sb, "INDEX_DIR", None))
+        out["search_backend.fields"] = list(sb.schema.names())
+    except Exception as e:
+        out["search_backend.error"] = repr(e)
+
+    # What search.indexer thinks (this is what web_app py currently imports run_search from)
+    try:
+        from vault_core.search import indexer as ix
+        out["indexer.INDEX_DIR"] = str(getattr(ix, "INDEX_DIR", None))
+        out["indexer.has_schema_attr"] = hasattr(ix, "schema")
+        if hasattr(ix, "schema"):
+            out["indexer.fields"] = list(ix.schema.names())
+    except Exception as e:
+        out["indexer.error"] = repr(e)
+
+    return jsonify(out)
 
 # -------------------------------------------------------------------
 # Routes: auth
@@ -872,7 +1050,6 @@ def signup():
     return render_template("signup.html", error=error, csrf_token=csrf_token)
 
 @app.route("/logout", methods=["POST"])
-@require_access
 def logout():
     _require_csrf()
     session.clear()
@@ -882,6 +1059,7 @@ def logout():
 # Routes: app
 # -------------------------------------------------------------------
 @app.route("/", methods=["GET"])
+@require_access
 def index_redirect():
     if request.query_string:
         return redirect(url_for("vault_search") + "?" + request.query_string.decode("utf-8"))
@@ -893,16 +1071,21 @@ def web_ingest():
     def _parse_urls_block(text: str) -> list[str]:
         out: list[str] = []
         seen: set[str] = set()
+
         for raw in (text or "").splitlines():
             s = raw.strip()
             if not s or s.startswith("#"):
                 continue
             if not (s.startswith("http://") or s.startswith("https://")):
                 continue
-            if s in seen:
+
+            norm = _normalize_url(s)
+            if not norm or norm in seen:
                 continue
-            seen.add(s)
+
+            seen.add(norm)
             out.append(s)
+
         return out
 
     if request.method == "POST":
@@ -911,7 +1094,6 @@ def web_ingest():
     active_nav = "web_ingest"
     query: str = ""
     case: str = ""
-    limit: int = 10
     error: str | None = None
     urls: str = ""
     mode: str = "search"
@@ -919,85 +1101,174 @@ def web_ingest():
     search_results: list[dict] = []
     ingested: list[dict] = []
     ingested_by_url: dict[str, dict] = {}
+    already_queued: set[str] = set()
+    queue_jobs: list[dict] = []
+    url_to_doc_id: dict[str, str] = {}
+    csrf_token = _get_csrf_token()
+    limit = DEFAULT_WEB_INGEST    
 
-    # Ensure these exist even on GET
     limit_raw: str = ""
     url_list: list[str] = []
 
     if request.method == "POST":
-        query = (request.form.get("query") or "").strip()
+        query = (request.form.get("query") or request.form.get("q") or "").strip()
         case = (request.form.get("case") or "").strip()
         limit_raw = (request.form.get("limit") or "").strip()
         urls = (request.form.get("urls") or "").strip()
 
         url_list = _parse_urls_block(urls)
-        mode = "urls" if url_list else "search"
 
-    # ---- limit parse (no clamp) ----
-    MAX_WEB_INGEST = int(os.getenv("STRAIGHTLINE_WEB_INGEST_MAX", "2000"))
-    try:
-        limit = int(limit_raw) if limit_raw else 10
-    except ValueError:
-        error = "Limit must be an integer."
-        limit = 10
-
-    # reject invalid ranges (validation, not clamping)
-    if request.method == "POST" and not error:
-        if limit < 1:
-            error = "Limit must be >= 1."
-        elif limit > MAX_WEB_INGEST:
-            error = f"Limit exceeds server max ({MAX_WEB_INGEST})."
-
-    # ---- validation ----
-    if request.method == "POST" and (not query and not url_list) and not error:
-        error = "Enter a Query or paste one or more URLs (http/https), one per line."
-
-    # ---- case defaulting ----
-    if not error and not case:
-        if query:
-            slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
-            case = f"{slug}_web" if slug else "web"
+        if url_list:
+            mode = "urls"
+        elif query:
+            mode = "search"
         else:
-            case = "web"
+            mode = "search"
 
-    # ---- build search_results ----
-    if not error:
-        if mode == "urls":
-            for u in url_list[:limit]:
-                search_results.append(
-                    {"title": "", "url": u, "snippet": "", "engine": "manual"}
-                )
-        else:
+        if limit_raw:
             try:
-                raw_results = metasearch(query, max_results=limit)
-            except Exception as e:
-                current_app.logger.exception("web_ingest: metasearch error")
-                error = f"Metasearch error: {e}"
-                raw_results = []
+                limit = int(limit_raw)
+            except ValueError:
+                error = "Limit must be an integer."
+                limit = DEFAULT_WEB_INGEST
+        else:
+            limit = DEFAULT_WEB_INGEST
 
-            if not error:
-                for r in raw_results:
-                    title = (r.get("title") if isinstance(r, dict) else getattr(r, "title", "")) or ""
-                    url = (r.get("url") if isinstance(r, dict) else getattr(r, "url", "")) or ""
-                    snippet = (r.get("snippet") if isinstance(r, dict) else getattr(r, "snippet", "")) or ""
-                    engine = (r.get("engine") if isinstance(r, dict) else getattr(r, "engine", "")) or ""
+        if not error:
+            if limit < 1:
+                error = "Limit must be >= 1."
+            elif limit > MAX_WEB_INGEST:
+                error = f"Limit exceeds server max ({MAX_WEB_INGEST})."
 
-                    if not url:
-                        continue
+        if not error and (not query and not url_list):
+            error = "Enter a Query or paste one or more URLs (http/https), one per line."
 
+        if not error and not case:
+            if query:
+                slug = re.sub(r"[^a-z0-9]+", "_", query.lower()).strip("_")
+                case = f"{slug}_web" if slug else "web"
+            else:
+                case = "web"
+
+        if not error:
+            if mode == "urls":
+                for u in url_list[:limit]:
                     search_results.append(
-                        {"title": title, "url": url, "snippet": snippet, "engine": engine}
+                        {
+                            "title": "",
+                            "url": u,
+                            "snippet": "",
+                            "engine": "manual",
+                        }
                     )
 
-                if not search_results:
-                    error = "No results returned from metasearch."
+            elif query:
+                try:
+                    raw_results = metasearch(query, max_results=limit)
+                except Exception as e:
+                    current_app.logger.exception("web_ingest: metasearch error")
+                    error = f"Metasearch error: {e}"
+                    raw_results = []
 
-    # ---- queue jobs ----
-    if not error:
-        JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+                if not error:
+                    for r in raw_results:
+                        title = (r.get("title") if isinstance(r, dict) else getattr(r, "title", "")) or ""
+                        url = (r.get("url") if isinstance(r, dict) else getattr(r, "url", "")) or ""
+                        snippet = (r.get("snippet") if isinstance(r, dict) else getattr(r, "snippet", "")) or ""
+                        engine = (r.get("engine") if isinstance(r, dict) else getattr(r, "engine", "")) or ""
+
+                        if not url:
+                            continue
+
+                        search_results.append(
+                            {
+                                "title": title,
+                                "url": url,
+                                "snippet": snippet,
+                                "engine": engine,
+                            }
+                        )
+
+                    if query and not search_results:
+                        error = "No results returned from metasearch."
+
+    already_queued = set()
+    try:
+        if JOBS_QUEUE_DIR.exists():
+            for p in JOBS_QUEUE_DIR.glob("*.json"):
+                try:
+                    payload = json.loads(p.read_text(encoding="utf-8"))
+                    u = str(payload.get("url") or "")
+                    norm = _normalize_url(u)
+                    if norm:
+                        already_queued.add(norm)
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    if not error and search_results:
+        uniq: list[dict] = []
+        seen_norm: set[str] = set()
 
         for hit in search_results:
-            url = hit["url"]
+            url = (hit.get("url") or "").strip()
+            if not url:
+                continue
+
+            norm = _normalize_url(url)
+
+            if norm and norm in already_queued:
+                item = {
+                    "url": url,
+                    "job_path": None,
+                    "error": "Already queued (skipped)",
+                    "status": "already_queued",
+                    "doc_id": None,
+                }
+                ingested.append(item)
+                ingested_by_url[url] = item
+                continue
+
+            if norm and norm in seen_norm:
+                continue
+
+            seen_norm.add(norm)
+            uniq.append(hit)
+
+        search_results = uniq
+
+    if request.method == "POST" and not error and search_results:
+        JOBS_QUEUE_DIR.mkdir(parents=True, exist_ok=True)
+
+        raw_url_to_doc = build_url_to_doc_id_map()
+        url_to_doc = {_normalize_url(k): v for k, v in (raw_url_to_doc or {}).items()}
+
+        seen_norm: set[str] = set()
+
+        for hit in search_results:
+            raw_url = str(hit.get("url") or "").strip()
+            norm_url = _normalize_url(raw_url)
+            if not norm_url:
+                continue
+
+            if norm_url in seen_norm:
+                continue
+            seen_norm.add(norm_url)
+
+            existing_doc_id = url_to_doc.get(norm_url)
+            if existing_doc_id:
+                item = {
+                    "url": raw_url,
+                    "job_path": None,
+                    "error": None,
+                    "status": "already_ingested",
+                    "doc_id": existing_doc_id,
+                }
+                ingested.append(item)
+                ingested_by_url[raw_url] = item
+                continue
+
             try:
                 ts = int(time.time() * 1000)
                 pid = os.getpid()
@@ -1006,7 +1277,7 @@ def web_ingest():
                 job_path = JOBS_QUEUE_DIR / job_name
 
                 payload = {
-                    "url": url,
+                    "url": raw_url,
                     "case": case,
                     "seed_meta": {
                         "search_title": (hit.get("title") or "").strip(),
@@ -1015,19 +1286,30 @@ def web_ingest():
                     },
                 }
 
-                job_path.write_text(
-                    json.dumps(payload, ensure_ascii=False),
-                    encoding="utf-8",
-                )
-                item = {"url": url, "job_path": str(job_path), "error": None}
+                tmp_path = job_path.with_suffix(".json.tmp")
+                tmp_path.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+                os.replace(tmp_path, job_path)
+
+                item = {
+                    "url": raw_url,
+                    "job_path": str(job_path),
+                    "error": None,
+                    "status": "queued",
+                    "doc_id": None,
+                }
             except Exception as e:
-                item = {"url": url, "job_path": None, "error": str(e)}
+                item = {
+                    "url": raw_url,
+                    "job_path": None,
+                    "error": str(e),
+                    "status": "error",
+                    "doc_id": None,
+                }
 
             ingested.append(item)
-            ingested_by_url[url] = item
+            ingested_by_url[raw_url] = item
 
-    # ---- show queued jobs on the page (always) ----
-    queue_jobs: list[dict] = []
+    queue_jobs = []
     try:
         if JOBS_QUEUE_DIR.exists():
             for p in sorted(JOBS_QUEUE_DIR.glob("*.json")):
@@ -1057,12 +1339,18 @@ def web_ingest():
                     pass
 
                 queue_jobs.append(
-                    {"name": name, "url": url, "case": case_field, "queued_at": queued_at}
+                    {
+                        "name": name,
+                        "url": url,
+                        "case": case_field,
+                        "queued_at": queued_at,
+                    }
                 )
     except Exception as e:
         _log_debug(f"web_ingest: failed to list queue jobs: {e!r}")
 
     url_to_doc_id = build_url_to_doc_id_map()
+    url_to_doc_record = build_url_to_doc_record_map()
     csrf_token = _get_csrf_token()
 
     return render_template(
@@ -1115,6 +1403,7 @@ def case_view(case_name: str):
 
         txt = rec.get("txt")
         pdf = rec.get("pdf")
+        html = rec.get("html")
         source_url = rec.get("source_url")
 
         doc_id = (str(rec.get("doc_id") or "")).strip() or None
@@ -1145,36 +1434,16 @@ def case_view(case_name: str):
                 "timestamp": rec.get("timestamp"),
                 "kind": rec.get("kind"),
                 "pdf": pdf,
+                "html": html,
                 "source_url": source_url,
                 "domain": _domain(source_url) if source_url else "",
                 "has_text": bool(txt),
+                "metadata": rec.get("metadata") or {},
             }
         )
 
     docs.sort(key=lambda d: d.get("timestamp") or "", reverse=True)
     return render_template("case.html", case_name=case_name, docs=docs, active_nav="cases")
-
-@app.route("/doc/<doc_id>", methods=["GET"])
-@require_access
-def doc_view(doc_id: str):
-    rec = find_manifest_by_doc_id(doc_id)
-    if not rec:
-        abort(404, description=f"No manifest record found for doc_id={doc_id!r}")
-
-    txt_path = rec.get("txt")
-    content, error = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing")
-
-    return render_template(
-        "doc.html",
-        doc_id=doc_id,
-        case_name=rec.get("case"),
-        kind=rec.get("kind"),
-        pdf=rec.get("pdf"),
-        source_url=rec.get("source_url"),
-        content=content,
-        error=error,
-        active_nav=None,
-    )
 
 # -------------------------------------------------------------------
 # Routes: document view
@@ -1189,19 +1458,25 @@ def doc_view(doc_id: str):
     txt_path = rec.get("txt")
     content, err = load_ocr_text(txt_path) if txt_path else (None, "TXT path missing")
 
+    meta = rec.get("metadata")
+    if not isinstance(meta, dict):
+        meta = {}
+
     return render_template(
         "doc.html",
         doc_id=doc_id,
         case_name=rec.get("case"),
         kind=rec.get("kind"),
         pdf=rec.get("pdf"),
+        txt=rec.get("txt"),
+        html=rec.get("html"),
         source_url=rec.get("source_url"),
+        timestamp=rec.get("timestamp"),
+        metadata=meta,
         content=content,
         error=err,
         active_nav=None,
     )
-
-
 # -------------------------------------------------------------------
 # Routes: search
 # -------------------------------------------------------------------
@@ -1223,9 +1498,8 @@ def vault_search():
 
     # ---- page/per_page parse (no clamp) ----
     MAX_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PAGE_MAX", "10000"))
-    MAX_PER_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PER_PAGE_MAX", "50"))
-    MIN_PER_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PER_PAGE_MIN", "5"))
-
+    MAX_PER_PAGE = int(os.getenv("STRAIGHTLINE_SEARCH_PER_PAGE_MAX", "1000"))
+    MIN_PER_PAGE = 1
     page_raw = (request.args.get("page") or "").strip()
     per_page_raw = (request.args.get("per_page") or "").strip()
 
@@ -1255,13 +1529,13 @@ def vault_search():
     # ---- run search ----
     if query and not error:
         try:
-            fetch_limit = page * per_page
-            raw_hits = run_search(query, limit=fetch_limit)
-
             start = (page - 1) * per_page
             end = start + per_page
-            page_hits = raw_hits[start:end]
 
+            fetch_limit = end + 1
+            raw_hits = run_search(query, limit=fetch_limit)
+
+            page_hits = raw_hits[start:end]
             results = [_decorate_hit(h) for h in page_hits]
 
             # TEMP SAFETY NET: remove after confirming _decorate_hit() always hydrates correctly
@@ -1285,6 +1559,7 @@ def vault_search():
                     r.setdefault("source_url", rec.get("source_url"))
                     r.setdefault("pdf", rec.get("pdf"))
                     r.setdefault("txt", rec.get("txt"))
+                    r.setdefault("html", rec.get("html"))
 
             has_prev = page > 1
             has_next = len(raw_hits) > end
@@ -1310,6 +1585,95 @@ def vault_search():
         showing_to=showing_to,
     )
 
+def _resolve_under_data_dir(p: str) -> Path:
+    """
+    Return an absolute Path to p, ensuring it is inside DATA_DIR.
+    Prevents path traversal / arbitrary reads.
+    """
+    from vault_core.manifest import DATA_DIR  # import here to avoid import-order games
+
+    candidate = Path(p)
+    if not candidate.is_absolute():
+        candidate = Path(DATA_DIR) / candidate
+
+    candidate = candidate.resolve()
+    data_root = Path(DATA_DIR).resolve()
+
+    if data_root not in candidate.parents and candidate != data_root:
+        raise ValueError(f"Path escapes DATA_DIR: {candidate}")
+
+    return candidate
+
+def _safe_resolve_under_data_dir(rel_path: str) -> Path:
+    """
+    Resolve a manifest-provided relative path under DATA_DIR safely.
+    Reject absolute paths and traversal.
+    """
+    rel_path = (rel_path or "").strip()
+    if not rel_path:
+        raise ValueError("empty path")
+
+    p = Path(rel_path)
+
+    if p.is_absolute():
+        raise ValueError("absolute path not allowed")
+
+    full = (DATA_DIR / p).resolve()
+
+    data_dir_resolved = DATA_DIR.resolve()
+    if data_dir_resolved not in full.parents and full != data_dir_resolved:
+        raise ValueError("path traversal detected")
+
+    return full
+
+
+@app.get("/download/<doc_id>")
+@require_access
+def download_doc(doc_id: str):
+    """
+    Download a TXT, PDF, or HTML snapshot for a manifest document.
+    /download/<doc_id>?kind=txt|pdf|html
+    """
+    kind = (request.args.get("kind") or "txt").lower().strip()
+    if kind not in ("txt", "pdf", "html"):
+        abort(400, description="kind must be txt, pdf, or html")
+    
+    rec = find_manifest_by_doc_id(doc_id)
+    if not rec:
+        abort(404, description="doc_id not found")
+
+    rel_path = rec.get(kind)  # "txt",  "pdf", or "html"
+    if not rel_path:
+        abort(404, description=f"no {kind} available for this doc")
+
+    try:
+        full_path = _safe_resolve_under_data_dir(str(rel_path))
+    except ValueError:
+        abort(404)
+
+    if not full_path.exists() or not full_path.is_file():
+        abort(404, description="file missing on disk")
+
+    if kind == "txt":
+        suffix = full_path.suffix or ".txt"
+        mimetype = "text/plain; charset=utf-8"
+    elif kind == "pdf":
+        suffix = full_path.suffix or ".pdf"
+        mimetype = "application/pdf"
+    else:
+        suffix = full_path.suffix or ".html"
+        mimetype = "text/html; charset=utf-8"
+
+    dl_name = f"{doc_id}{suffix}"
+
+    return send_file(
+        full_path,
+        as_attachment=True,
+        download_name=dl_name,
+        mimetype=mimetype,
+        conditional=True,
+        max_age=0,
+    )
 
 # -------------------------------------------------------------------
 # Local dev entrypoint (optional)

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Dict, List
+from typing import Dict, List, Optional
 
 from whoosh import index
 from whoosh.fields import ID, TEXT, Schema
@@ -55,7 +55,7 @@ def update_index_for_file(txt_path: Path) -> None:
     log.info("Updated index for: %s", txt_path)
 
 
-def search_index(query: str, limit: int = 10) -> List[Dict]:
+def search_index(query: str, limit: Optional[int] = None) -> List[Dict]:
     """
     Run a full-text search against the index and return a list of hits.
 
@@ -97,7 +97,7 @@ def run_search(
     query: str,
     case: str | None = None,
     kind: str | None = None,
-    limit: int = 20,
+    limit: Optional[int] = None,
 ):
     """
     Web/UI-facing wrapper for search.

@@ -49,12 +49,16 @@ def load_job(path: Path) -> Optional[Job]:
         data = json.loads(path.read_text(encoding="utf-8"))
         url = data.get("url")
         case = data.get("case")
+
         if not isinstance(url, str) or not url:
             _log_debug(f"worker: invalid job file (no url): {path}")
             return None
+
         if case is not None and not isinstance(case, str):
             case = None
+
         return Job(path=path, url=url, case=case)
+
     except Exception as e:
         _log_debug(f"worker: failed to load job {path}: {e!r}")
         return None
@@ -69,17 +73,20 @@ def claim_next_job() -> Optional[Job]:
     PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
     FAILED_DIR.mkdir(parents=True, exist_ok=True)
 
-    # Sort for a little FIFO behaviour
     for entry in sorted(QUEUE_DIR.iterdir()):
         if not entry.is_file():
             continue
 
+        if not os.access(entry, os.W_OK):
+            _log_debug(
+                f"worker: skipping job not writable by worker (ownership/perm issue): {entry}"
+            )
+            continue
+
         processing_path = PROCESSING_DIR / entry.name
         try:
-            # Atomic move: if two workers race, only one succeeds
             entry.replace(processing_path)
         except FileNotFoundError:
-            # Another worker got it first
             continue
         except Exception as e:
             _log_debug(f"worker: error claiming job {entry}: {e!r}")
@@ -87,7 +94,6 @@ def claim_next_job() -> Optional[Job]:
 
         job = load_job(processing_path)
         if job is None:
-            # Bad job file -> failed
             try:
                 processing_path.replace(FAILED_DIR / processing_path.name)
             except Exception as e:
@@ -105,6 +111,7 @@ def mark_done(job: Job, ok: bool) -> None:
     """Move job file from processing/ -> done/ or failed/."""
     target_dir = DONE_DIR if ok else FAILED_DIR
     target_dir.mkdir(parents=True, exist_ok=True)
+
     try:
         job.path.replace(target_dir / job.path.name)
     except Exception as e:
@@ -113,10 +120,21 @@ def mark_done(job: Job, ok: bool) -> None:
 
 def main() -> None:
     _log_debug("job_worker: starting")
+
     QUEUE_DIR.mkdir(parents=True, exist_ok=True)
     PROCESSING_DIR.mkdir(parents=True, exist_ok=True)
     DONE_DIR.mkdir(parents=True, exist_ok=True)
     FAILED_DIR.mkdir(parents=True, exist_ok=True)
+
+    # ---- orphan reaper: reclaim stale processing jobs on startup ----
+    for entry in sorted(PROCESSING_DIR.iterdir()):
+        if not entry.is_file():
+            continue
+        try:
+            entry.replace(QUEUE_DIR / entry.name)
+            _log_debug(f"job_worker: re-queued orphaned processing job: {entry.name}")
+        except Exception as e:
+            _log_debug(f"job_worker: failed to re-queue {entry}: {e!r}")
 
     while True:
         job = claim_next_job()

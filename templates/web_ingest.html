@@ -90,7 +90,6 @@
           name="limit"
           type="number"
           min="1"
-          max="20"
           value="{{ limit or 10 }}"
         >
       </div>
@@ -149,6 +148,7 @@
         {% for r in search_results %}
           {% set ingest = ingested_by_url.get(r.url) if ingested_by_url is defined else None %}
           {% set suggests = url_to_doc_id.get(r.url) if url_to_doc_id is defined else None %}
+          {% set docrec = url_to_doc_record.get(r.url) if url_to_doc_record is defined else None %}
           <tr>
             <td>
               {% if suggests %}
@@ -185,6 +185,7 @@
 
             <td class="url-cell">
               <code>{{ r.url }}</code>
+
               <div style="margin-top:0.25rem;">
                 {% if ingest %}
                   {% if ingest.error %}
@@ -196,6 +197,32 @@
                       Enqueued → <code>{{ ingest.job_path }}</code>
                     </span>
                   {% endif %}
+                  {% elif suggests %}
+                    <span class="meta-soft">
+                      Already ingested.
+                    </span>
+                  <div class="meta-soft" style="margin-top:0.25rem;">
+                    <a href="{{ url_for('doc_view', doc_id=suggests) }}">Open doc</a>
+                  </div>
+
+                  {% if docrec and docrec.txt %}
+                    <div class="meta-soft" style="margin-top:0.25rem;">
+                      <a href="{{ url_for('download_doc', doc_id=suggests, kind='txt') }}">TXT</a>
+                    </div>
+                  {% endif %}
+
+                  {% if docrec and docrec.pdf %}
+                    <div class="meta-soft" style="margin-top:0.25rem;">
+                      <a href="{{ url_for('download_doc', doc_id=suggests, kind='pdf') }}">PDF</a>
+                    </div>
+                  {% endif %}
+
+                  {% if docrec and docrec.html %}
+                    <div class="meta-soft" style="margin-top:0.25rem;">
+                      <a href="{{ url_for('download_doc', doc_id=suggests, kind='html') }}">HTML</a>
+                    </div>
+                  {% endif %}
+               
                 {% else %}
                   <span class="meta-soft">
                     Not enqueued (URL didn't match document-like heuristics).

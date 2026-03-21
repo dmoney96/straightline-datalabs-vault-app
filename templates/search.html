@@ -186,6 +186,30 @@
           {% endif %}
         </div>
 
+        {% if r.doc_id %}
+          <div class="meta" style="margin-top:0.35rem;">
+            <a href="{{ url_for('doc_view', doc_id=r.doc_id) }}">Open doc</a>
+
+            {% if r.txt %}
+              <span style="margin-left:0.55rem;">
+                · <a href="{{ url_for('download_doc', doc_id=r.doc_id, kind='txt') }}">Download TXT</a>
+              </span>
+            {% endif %}
+
+            {% if r.pdf %}
+              <span style="margin-left:0.55rem;">
+                · <a href="{{ url_for('download_doc', doc_id=r.doc_id, kind='pdf') }}">Download PDF</a>
+              </span>
+            {% endif %}
+
+            {% if r.html %}
+              <span style="margin-left:0.55rem;">
+                · <a href="{{ url_for('download_doc', doc_id=r.doc_id, kind='html') }}">Download HTML</a>
+              </span>
+            {% endif %}
+          </div>
+        {% endif %}
+
         {% if r.case or r.kind %}
           <div class="meta" style="margin-top:0.35rem;">
             {% if r.case %}
@@ -195,6 +219,16 @@
               <span class="pill-badge pill-badge--kind">Ingest: {{ r.kind }}</span>
             {% endif %}
           </div>
+        {% endif %}
+
+        {% if r.metadata.last_modified %}
+          <div class="metasoft" style="margin-top:0.35rem;">
+            {% endif %}
+    
+        {% if r.metadata.title %}
+          <div style="margin-left:0.75;">Modified: <code>{{ r.metadata.title }}</div>
+        {% elif r.metadata.page+title %}
+          <div style="margin-top:0.2rem;">Title: {{ r.metadata.page_title }}</div>
         {% endif %}
 
         {% if r.score is not none %}

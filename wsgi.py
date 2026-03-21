@@ -15,6 +15,11 @@ ROOT = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from vault_core.paths import DATA_ROOT, INDEX_DIR, RUNTIME_ROOT
+print("WSGI DATA_ROOT:", DATA_ROOT)
+print("WSGI INDEX_DIR:", INDEX_DIR)
+print("WSGI RUNTIME_ROOT:", RUNTIME_ROOT)
+
 # Also add scripts/ so we can import scripts.web_app
 SCRIPTS_DIR = ROOT / "scripts"
 if SCRIPTS_DIR.is_dir() and str(SCRIPTS_DIR) not in sys.path:

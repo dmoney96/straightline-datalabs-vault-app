@@ -76,19 +76,16 @@
       {% endif %}
     </div>
 
+      {% if html %}
+        <div>
+          <strong>HTML snapshot:</strong>
+          <a href="{{ url_for('download_doc',doc_id=doc_id, kind='html') }}">
+            
+
     <div>PDF path</div>
     <div>
       {% if pdf %}
         <code>{{ pdf }}</code>
-      {% else %}
-        <span class="meta-soft">—</span>
-      {% endif %}
-    </div>
-
-    <div>HTML path</div>
-    <div>
-      {% if html %}
-        <code>{{ html }}</code>
       {% else %}
         <span class="meta-soft">—</span>
       {% endif %}
@@ -133,18 +130,12 @@
 
   <div class="meta" style="margin-top:0.85rem;">
     {% if txt %}
-      <a href="{{ url_for('download_doc', doc_id=doc_id, kind='txt') }}">Download TXT</a>
+       <a href="{{ url_for('download_doc', doc_id=doc_id, kind='txt') }}">Download TXT</a>
     {% endif %}
 
     {% if pdf %}
       <span style="margin-left:0.75rem;">
         <a href="{{ url_for('download_doc', doc_id=doc_id, kind='pdf') }}">Download PDF</a>
-      </span>
-    {% endif %}
-
-    {% if html %}
-      <span style="margin-left:0.75rem;">
-        <a href="{{ url_for('download_doc', doc_id=doc_id, kind='html') }}">Download HTML</a>
       </span>
     {% endif %}
 

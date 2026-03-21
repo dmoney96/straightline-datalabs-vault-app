@@ -35,17 +35,19 @@
       <table class="table--data">
         <thead>
           <tr>
-            <th style="width:18%;">Timestamp (UTC)</th>
-            <th style="width:26%;">Doc ID</th>
+            <th style="width:16%;">Timestamp (UTC)</th>
+            <th style="width:24%;">Doc ID</th>
             <th style="width:14%;">Case</th>
             <th style="width:10%;">Kind</th>
-            <th style="width:32%;">Source URL</th>
+            <th style="width:24%;">Source URL</th>
+            <th style="width:12%;">Actions</th>
           </tr>
         </thead>
 
         <tbody>
           {% for d in docs %}
             <tr>
+
               <!-- Timestamp -->
               <td>
                 <code>{{ d.timestamp }}</code>
@@ -53,7 +55,7 @@
 
               <!-- Doc ID -->
               <td class="docid-cell">
-                <a href="/doc/{{ d.doc_id }}">
+                <a href="{{ url_for('doc_view', doc_id=d.doc_id) }}">
                   <code>{{ d.doc_id }}</code>
                 </a>
               </td>
@@ -64,15 +66,60 @@
               <!-- Kind -->
               <td>{{ d.kind or "" }}</td>
 
-              <!-- Source URL -->
+              <!-- Source URL + metadata -->
               <td class="url-cell">
                 {% if d.source_url %}
                   <code>{{ d.source_url }}</code>
+                {% else %}
+                  <span class="meta-soft">—</span>
+                {% endif %}
+
+                {% if d.metadata %}
+                  <div class="meta-soft" style="margin-top:0.35rem;">
+                    {% if d.metadata.content_type %}
+                      <div>Type: <code>{{ d.metadata.content_type }}</code></div>
+                    {% endif %}
+
+                    {% if d.metadata.last_modified %}
+                      <div>Modified: <code>{{ d.metadata.last_modified }}</code></div>
+                    {% endif %}
+
+                    {% if d.metadata.title %}
+                      <div>Title: {{ d.metadata.title }}</div>
+                    {% elif d.metadata.page_title %}
+                      <div>Title: {{ d.metadata.page_title }}</div>
+                    {% endif %}
+                  </div>
                 {% endif %}
               </td>
+
+              <!-- Actions -->
+              <td>
+                <a href="{{ url_for('doc_view', doc_id=d.doc_id) }}">Open doc</a>
+
+                {% if d.has_text %}
+                  <div class="meta-soft" style="margin-top:0.25rem;">
+                    <a href="{{ url_for('download_doc', doc_id=d.doc_id, kind='txt') }}">TXT</a>
+                  </div>
+                {% endif %}
+
+                {% if d.pdf %}
+                  <div class="meta-soft" style="margin-top:0.25rem;">
+                    <a href="{{ url_for('download_doc', doc_id=d.doc_id, kind='pdf') }}">PDF</a>
+                  </div>
+                {% endif %}
+
+                {% if d.html %}
+                  <div class="meta-soft" style="margin-top:0.25rem;">
+                    <a href="{{ url_for('download_doc', doc_id=d.doc_id, kind='html') }}">HTML</a>
+                  </div>
+                {% endif %}
+              </td>
+
             </tr>
           {% endfor %}
         </tbody>
+
       </table>
     </div>
   {% endif %}

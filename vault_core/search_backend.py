@@ -54,7 +54,7 @@ schema = Schema(
     doc_id=ID(stored=True, unique=True),
     case=KEYWORD(stored=True, commas=True, lowercase=True, scorable=False),
     kind=KEYWORD(stored=True, commas=True, lowercase=True, scorable=False),
-    source=ID(stored=True),
+    source_file=ID(stored=True),
     content=TEXT(stored=True, analyzer=content_analyzer),
 )
 
@@ -138,7 +138,7 @@ def index_txt_document(txt_path: str) -> None:
             doc_id=doc_id,
             case=(meta.get("case") or "uncategorized").lower(),
             kind=(meta.get("kind") or "unknown").lower(),
-            source=meta.get("source") or "",
+            source_file=meta.get("source_file") or str(txt_path),
             content=text,
         )
     finally:
@@ -149,9 +149,9 @@ import unicodedata
 
 def run_search(
     query: str,
-    case: Optional[str] = None,
-    kind: Optional[str] = None,
-    limit: int = 20,
+    case: str | None = None,
+    kind: str | None = None,
+    limit: int | None = None,
 ) -> List[SearchResult]:
     """
     Run a BM25F search over the index.
@@ -171,7 +171,7 @@ def run_search(
         weighting=scoring.BM25F(field_B={"content": 0.75}, K1=1.5)
     ) as searcher:
         parser = qparser.MultifieldParser(
-            ["content", "doc_id", "source", "case", "kind"],
+            ["content", "doc_id", "source_file", "case", "kind"],
             schema=ix.schema,
             group=qparser.OrGroup.factory(0.9),
         )
@@ -194,7 +194,7 @@ def run_search(
         if filters:
             parsed = q.And([parsed] + filters)
 
-        hits = searcher.search(parsed, limit=limit)
+        hits = searcher.search(parsed, limit=limit)  # limit=None means "no limit" in Whoosh
         hits.fragmenter = highlight.ContextFragmenter(
             maxchars=220,
             surround=60,

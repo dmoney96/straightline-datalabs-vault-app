@@ -9,26 +9,6 @@ import requests
 
 logger = logging.getLogger(__name__)
 
-def _to_int(value, default: int) -> int:
-    try:
-        return int(value)
-    except Exception:
-        return default
-
-
-def _optional_cap(n: int) -> int:
-    """
-    Optional cap controlled ONLY by env var.
-    If SEARCH_MAX_RESULTS_CAP is unset/blank, we do NOT cap.
-    """
-    cap_raw = os.getenv("SEARCH_MAX_RESULTS_CAP", "").strip()
-    if not cap_raw:
-        return n  # no cap
-
-    cap = _to_int(cap_raw, n)
-    if cap < 1:
-        return n  # ignore nonsense caps
-    return min(n, cap)
 
 @dataclass
 class SearchResult:
@@ -60,11 +40,8 @@ def _brave_search(query: str, max_results: int = 10) -> List[SearchResult]:
     if not key:
         raise MetasearchError("BRAVE_API_KEY (or BRAVE_SUBSCRIPTION_TOKEN) not set")
 
-    max_results = _to_int(max_results, 10)
-    if max_results < 1:
-        max_results = 1
-    max_results = _optional_cap(max_results)
-    
+    max_results = max(1, min(max_results, 20))
+
     endpoint = "https://api.search.brave.com/res/v1/web/search"
     params = {
         "q": query,
@@ -140,10 +117,7 @@ def _serpapi_search(query: str, max_results: int = 10) -> List[SearchResult]:
         )
         engine = "google"
 
-    max_results = _to_int(max_results, 10)
-    if max_results < 1:
-        max_results = 1
-    max_results = _optional_cap(max_results)
+    max_results = max(1, min(max_results, 20))
 
     endpoint = "https://serpapi.com/search.json"
     params = {
@@ -271,23 +245,31 @@ def _run_provider(name: str, query: str, max_results: int) -> List[SearchResult]
 
 def metasearch(query: str, max_results: int = 10) -> List[SearchResult]:
     """
-    Hybrid metasearch with configurable provider order.
+    Simple hybrid metasearch with configurable provider order.
 
-    Key behavior:
-      - We try providers in order.
-      - We KEEP GOING until we collect max_results total (deduped by URL),
-        or we exhaust all providers.
-      - No arbitrary caps here. Only provider/API realities apply inside each provider.
+    Env influence:
+
+      PRIMARY_SEARCH_PROVIDER   (default: 'brave')
+      SECONDARY_SEARCH_PROVIDER (default: 'serpapi')
+      TERTIARY_SEARCH_PROVIDER  (default: 'google_cse')
+      SEARCH_MAX_RESULTS        (optional global clamp)
+
+    Provider names understood: 'brave', 'serpapi', 'google_cse'
+
+    Behaviour:
+      - We walk providers in the configured order.
+      - First provider that returns *any* results wins.
+      - If all fail or return nothing, MetasearchError is raised.
     """
-    # Normalize input (no arbitrary cap)
+    # Respect a global clamp, but never exceed per-provider caps
     try:
-        max_results = int(max_results)
-    except Exception:
-        max_results = 10
-    if max_results < 1:
-        max_results = 1
+        global_max = int(os.getenv("SEARCH_MAX_RESULTS", str(max_results)))
+    except ValueError:
+        global_max = max_results
 
-    order: List[str] = []
+    max_results = max(1, min(max_results, global_max, 20))
+
+    order = []
     primary = os.getenv("PRIMARY_SEARCH_PROVIDER", "brave").strip().lower()
     secondary = os.getenv("SECONDARY_SEARCH_PROVIDER", "serpapi").strip().lower()
     tertiary = os.getenv("TERTIARY_SEARCH_PROVIDER", "google_cse").strip().lower()
@@ -296,22 +278,17 @@ def metasearch(query: str, max_results: int = 10) -> List[SearchResult]:
         if name and name in _PROVIDER_FUNCS and name not in order:
             order.append(name)
 
+    # If env vars are nonsense, fallback to a safe default sequence
     if not order:
         order = ["brave", "serpapi", "google_cse"]
 
-    logger.warning("META: provider order=%s requested=%d", order, max_results)
+    logger.warning("META: provider order=%s max_results=%d", order, max_results)
 
-    collected: List[SearchResult] = []
-    seen_urls: set[str] = set()
     last_error: Exception | None = None
 
     for provider_name in order:
-        remaining = max_results - len(collected)
-        if remaining <= 0:
-            break
-
         try:
-            batch = _run_provider(provider_name, query, remaining)
+            results = _run_provider(provider_name, query, max_results)
         except MetasearchError as e:
             logger.warning("META: provider %s unavailable: %r", provider_name, e)
             last_error = e
@@ -321,31 +298,13 @@ def metasearch(query: str, max_results: int = 10) -> List[SearchResult]:
             last_error = e
             continue
 
-        if not batch:
-            logger.warning("META: provider %s returned 0 results", provider_name)
-            continue
+        if results:
+            logger.warning(
+                "META: returning %d result(s) from %s", len(results), provider_name
+            )
+            return results
 
-        added = 0
-        for r in batch:
-            if not r.url or r.url in seen_urls:
-                continue
-            seen_urls.add(r.url)
-            collected.append(r)
-            added += 1
-            if len(collected) >= max_results:
-                break
-
-        logger.warning(
-            "META: provider %s added=%d total=%d/%d",
-            provider_name,
-            added,
-            len(collected),
-            max_results,
-        )
-
-    if collected:
-        return collected
-
+    # Nothing worked
     if last_error:
         raise MetasearchError(f"No provider returned results; last error: {last_error}")
     raise MetasearchError("No search provider returned any results")
