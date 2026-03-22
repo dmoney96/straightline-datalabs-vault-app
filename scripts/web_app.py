@@ -1349,8 +1349,12 @@ def web_ingest():
     except Exception as e:
         _log_debug(f"web_ingest: failed to list queue jobs: {e!r}")
 
-    url_to_doc_id = build_url_to_doc_id_map()
-    url_to_doc_record = build_url_to_doc_record_map()
+    raw_url_to_doc_id = build_url_to_doc_id_map()
+    raw_url_to_doc_record = build_url_to_doc_record_map()
+
+    url_to_doc_id = {_normalize_url(k): v for k, v in raw_url_to_doc_id.items()}
+    url_to_doc_record = {_normalize_url(k): v for k, v in raw_url_to_doc_record.items()}
+
     csrf_token = _get_csrf_token()
 
     return render_template(

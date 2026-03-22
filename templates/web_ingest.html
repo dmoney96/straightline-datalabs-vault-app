@@ -146,6 +146,8 @@
       </thead>
       <tbody>
         {% for r in search_results %}
+          {% set norm_url = r.url|replace('#', '#') %}
+          {% set norm_url = r.url %}
           {% set ingest = ingested_by_url.get(r.url) if ingested_by_url is defined else None %}
           {% set suggests = url_to_doc_id.get(r.url) if url_to_doc_id is defined else None %}
           {% set docrec = url_to_doc_record.get(r.url) if url_to_doc_record is defined else None %}
@@ -184,9 +186,9 @@
             </td>
 
             <td class="url-cell">
-              <code>{{ r.url }}</code>
+              <code>{{ r.url }}</code>            
 
-              <div style="margin-top:0.25rem;">
+             <div style="margin-top:0.25rem;">
                 {% if ingest %}
                   {% if ingest.error %}
                     <span class="error">
@@ -197,10 +199,28 @@
                       Enqueued → <code>{{ ingest.job_path }}</code>
                     </span>
                   {% endif %}
-                  {% elif suggests %}
-                    <span class="meta-soft">
-                      Already ingested.
-                    </span>
+                 {% elif suggests %}
+                  <span class="meta-soft">
+                    Already ingested.
+                  </span>
+
+                  {% if docrec and docrec.metadata %}
+                    <div class="meta-soft" style="margin-top:0.35rem;">
+                      {% if docrec.metadata.content_type %}
+                        <div>Type: <code>{{ docrec.metadata.content_type }}</code></div>
+                      {% endif %}
+
+                      {% if docrec.metadata.last_modified %}
+                        <div>Modified: <code>{{ docrec.metadata.last_modified }}</code></div>
+                      {% endif %}
+
+                      {% if docrec.metadata.title %}
+                        <div>Title: {{ docrec.metadata.title }}</div>
+                      {% elif docrec.metadata.page_title %}
+                        <div>Title: {{ docrec.metadata.page_title }}</div>
+                      {% endif %}
+                    </div>
+                  {% endif %}
                   <div class="meta-soft" style="margin-top:0.25rem;">
                     <a href="{{ url_for('doc_view', doc_id=suggests) }}">Open doc</a>
                   </div>
@@ -222,7 +242,7 @@
                       <a href="{{ url_for('download_doc', doc_id=suggests, kind='html') }}">HTML</a>
                     </div>
                   {% endif %}
-               
+
                 {% else %}
                   <span class="meta-soft">
                     Not enqueued (URL didn't match document-like heuristics).
@@ -230,6 +250,8 @@
                 {% endif %}
               </div>
             </td>
+
+
           </tr>
         {% endfor %}
       </tbody>
@@ -264,9 +286,38 @@
           <tr>
             <td><code>{{ job.queued_at or "" }}</code></td>
             <td>{{ job.case or "" }}</td>
-            <td class="url-cell">
+          <td class="url-cell">
               {% if job.url %}
-                <code>{{ job.url }}</code>
+                <a href="{{ job.url }}" target="_blank" rel="noopener noreferrer">
+                  <code>{{ job.url }}</code>
+                </a>
+
+                {% set qdoc_id = url_to_doc_id.get(job.url) if url_to_doc_id is defined else None %}
+                {% set qdocrec = url_to_doc_record.get(job.url) if url_to_doc_record is defined else None %}
+
+                {% if qdoc_id %}
+                  <div class="meta-soft" style="margin-top:0.25rem;">
+                    Already present:
+                    <a href="{{ url_for('doc_view', doc_id=qdoc_id) }}">Open doc</a>
+                  </div>
+
+                  {% if qdocrec and qdocrec.metadata %}
+                    <div class="meta-soft" style="margin-top:0.35rem;">
+                      {% if qdocrec.metadata.content_type %}
+                        <div>Type: <code>{{ qdocrec.metadata.content_type }}</code></div>
+                      {% endif %}
+                      {% if qdocrec.metadata.last_modified %}
+                        <div>Modified: <code>{{ qdocrec.metadata.last_modified }}</code></div>
+                      {% endif %}
+                      {% if qdocrec.metadata.title %}
+                        <div>Title: {{ qdocrec.metadata.title }}</div>
+                      {% elif qdocrec.metadata.page_title %}
+                        <div>Title: {{ qdocrec.metadata.page_title }}</div>
+                      {% endif %}
+                    </div>
+                  {% endif %}
+                {% endif %}
+
               {% else %}
                 <code>{{ job.name }}</code>
               {% endif %}

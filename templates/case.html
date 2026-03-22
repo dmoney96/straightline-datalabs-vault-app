@@ -46,7 +46,9 @@
 
               <td class="docid-cell">
                 {% if d.doc_id %}
-                  <code>{{ d.doc_id }}</code>
+                  <a href="{{ url_for('doc_view', doc_id=d.doc_id) }}">
+                    <code>{{ d.doc_id }}</code>
+                  </a>
                 {% else %}
                   <span class="meta-soft">(unknown)</span>
                 {% endif %}
@@ -66,6 +68,7 @@
                 {% else %}
                   <span class="meta-soft">—</span>
                 {% endif %}
+
                 {% if d.has_text is not none %}
                   <div class="meta-soft" style="margin-top:0.2rem;">
                     Text: {{ "ready" if d.has_text else "pending" }}
@@ -75,18 +78,17 @@
 
               <td class="url-cell">
                 {% if d.source_url %}
-                  <a href="{{ d.source_url }}" target="_blank" rel="nooperner noreferrer">
+                  <a href="{{ d.source_url }}" target="_blank" rel="noopener noreferrer">
                     <code>{{ d.source_url }}</code>
                   </a>
                 {% elif d.pdf %}
                   <code>{{ d.pdf }}</code>
                 {% else %}
-                  <span class="meta-soft">-</span>
+                  <span class="meta-soft">—</span>
                 {% endif %}
-              </td>
 
                 {% if d.metadata %}
-                  <div class="meta-soft" style="margin-top:0.35;">
+                  <div class="meta-soft" style="margin-top:0.35rem;">
                     {% if d.metadata.content_type %}
                       <div>Type: <code>{{ d.metadata.content_type }}</code></div>
                     {% endif %}
@@ -98,15 +100,16 @@
                     {% elif d.metadata.page_title %}
                       <div>Title: {{ d.metadata.page_title }}</div>
                     {% endif %}
-                  </td>
-                   
+                  </div>
+                {% endif %}
+              </td>
 
               <td>
                 {% if d.doc_id and d.doc_id != "(unknown)" %}
                   <a href="{{ url_for('doc_view', doc_id=d.doc_id) }}">Open doc</a>
 
                   {% if d.has_text %}
-                    <div_class="meta-soft" style="margin-top:0.25rem;">
+                    <div class="meta-soft" style="margin-top:0.25rem;">
                       <a href="{{ url_for('download_doc', doc_id=d.doc_id, kind='txt') }}">Download TXT</a>
                     </div>
                   {% endif %}
@@ -119,20 +122,19 @@
 
                   {% if d.html %}
                     <div class="meta-soft" style="margin-top:0.25rem;">
-                      <a href="{{ url_for('download_doc'm doc_id=d.doc_id, kind='html') }}">Download HTML</a>
+                      <a href="{{ url_for('download_doc', doc_id=d.doc_id, kind='html') }}">Download HTML</a>
                     </div>
                   {% endif %}
-                {% else%}
-                  <span class="meta-soft">-</span>
+                {% else %}
+                  <span class="meta-soft">—</span>
                 {% endif %}
 
                 {% if d.source_url %}
                   <div class="meta-soft" style="margin-top:0.25rem;">
-                    <a href="{{ d.source_url }}" target="_blank" rel=noopener noreferrer">Open source ↗</a>
+                    <a href="{{ d.source_url }}" target="_blank" rel="noopener noreferrer">Open source ↗</a>
                   </div>
                 {% endif %}
               </td>
-
             </tr>
           {% endfor %}
         </tbody>
