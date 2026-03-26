@@ -221,14 +221,17 @@
           </div>
         {% endif %}
 
-        {% if r.metadata.last_modified %}
-          <div class="metasoft" style="margin-top:0.35rem;">
+        {% if r.metadata.last_modified or r.metadata.title or r.metadata.page_title %}
+          <div class="meta-soft" style="margin-top:0.35rem;">
+            {% if r.metadata.last_modified %}
+              <div>Modified: <code>{{ r.metadata.last_modified }}</code></div>
             {% endif %}
-    
-        {% if r.metadata.title %}
-          <div style="margin-left:0.75;">Modified: <code>{{ r.metadata.title }}</div>
-        {% elif r.metadata.page+title %}
-          <div style="margin-top:0.2rem;">Title: {{ r.metadata.page_title }}</div>
+            {% if r.metadata.title %}
+              <div>Title: {{ r.metadata.title }}</div>
+            {% elif r.metadata.page_title %}
+              <div>Title: {{ r.metadata.page_title }}</div>
+            {% endif %}
+          </div>
         {% endif %}
 
         {% if r.score is not none %}
